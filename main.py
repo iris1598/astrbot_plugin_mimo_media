@@ -34,6 +34,8 @@ DEFAULT_FPS = 2.0
 DEFAULT_RESOLUTION = "default"
 DEFAULT_MAX_BASE64_MB = 49.0
 DEFAULT_MAX_VIDEO_WIDTH = 1280
+DEFAULT_AUDIO_MODE = "multimodal"
+LLONEBOT_STT_AUDIO_MODE = "llonebot_stt"
 
 VIDEO_MIME = "video/mp4"
 AUDIO_MIME = "audio/wav"
@@ -207,6 +209,12 @@ class MiMoMediaPlugin(Star):
     def _enabled(self) -> bool:
         return bool(self._cfg("enable", True))
 
+    def _audio_mode(self) -> str:
+        mode = str(self._cfg("audio_mode", DEFAULT_AUDIO_MODE) or "").strip().lower()
+        if mode not in (DEFAULT_AUDIO_MODE, LLONEBOT_STT_AUDIO_MODE):
+            return DEFAULT_AUDIO_MODE
+        return mode
+
     def _is_mimo_provider(self, event: AstrMessageEvent) -> bool:
         """判定当前会话激活的对话提供商是否为小米 MiMo。"""
         try:
@@ -242,25 +250,42 @@ class MiMoMediaPlugin(Star):
     async def _handle(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         videos = self._collect_video_components(event)
         request_audio_refs = list(req.audio_urls or [])
-        audio_records = self._collect_audio_components(event)
-        if audio_records:
-            self._replace_empty_text_for_quoted_audio(req)
-        if audio_records:
-            audio_refs = []
-            for record in audio_records:
-                source = await self._get_record_source(record)
-                if source:
-                    audio_refs.append(source)
-            # 某些非标准事件没有可用的原始 Record 源，保留请求中的路径作为兼容回退。
-            if not audio_refs:
-                audio_refs = list(req.audio_urls or [])
+        audio_targets = self._collect_audio_targets(event)
+        audio_records = [record for record, _, _ in audio_targets]
+        audio_mode = self._audio_mode()
+        audio_refs: list[str] = []
+        transcriptions: list[tuple[str, bool]] = []
+        notes: list[str] = []
+
+        if audio_mode == LLONEBOT_STT_AUDIO_MODE:
+            req.audio_urls = []
+            if audio_targets:
+                transcriptions = await self._transcribe_with_llonebot(
+                    event,
+                    audio_targets,
+                )
+                self._inject_llonebot_transcriptions(req, transcriptions)
+                if not transcriptions:
+                    notes.append("[语音转文字失败，已跳过]")
+            elif request_audio_refs:
+                notes.append("[语音转文字失败：无法获取 OneBot 消息 ID]")
         else:
-            audio_refs = list(req.audio_urls or [])
-        if not videos and not audio_refs:
+            if audio_records:
+                for record in audio_records:
+                    source = await self._get_record_source(record)
+                    if source:
+                        audio_refs.append(source)
+                # 某些非标准事件没有可用的原始 Record 源，保留请求中的路径作为兼容回退。
+                if not audio_refs:
+                    audio_refs = list(req.audio_urls or [])
+                self._replace_empty_text_for_quoted_audio(req)
+            else:
+                audio_refs = list(req.audio_urls or [])
+
+        if not videos and not audio_refs and not transcriptions and not notes:
             return
 
         added_media_parts: list[ContentPart] = []
-        notes: list[str] = []
         cleanup_paths: list[str] = []
         # 原始 Record 优先时，清理由 AstrBot 预先生成但插件不会再使用的音频文件。
         for request_audio_ref in request_audio_refs:
@@ -281,15 +306,16 @@ class MiMoMediaPlugin(Star):
 
         # 2. 音频：取得原始文件 -> FFmpeg 转标准 WAV -> Base64 Data URL
         req.audio_urls = []
-        for audio_ref in audio_refs:
-            part, note, paths = await self._process_audio(audio_ref)
-            cleanup_paths.extend(paths)
-            if part is not None:
-                added_media_parts.append(part)
-            if note:
-                notes.append(note)
+        if audio_mode == DEFAULT_AUDIO_MODE:
+            for audio_ref in audio_refs:
+                part, note, paths = await self._process_audio(audio_ref)
+                cleanup_paths.extend(paths)
+                if part is not None:
+                    added_media_parts.append(part)
+                if note:
+                    notes.append(note)
 
-        if not added_media_parts and not notes:
+        if not added_media_parts and not notes and not transcriptions:
             return
 
         # 3. 移除核心生成的占位符文本，替换为真实媒体内容
@@ -335,6 +361,99 @@ class MiMoMediaPlugin(Star):
                     if isinstance(reply_comp, Record):
                         records.append(reply_comp)
         return records
+
+    @staticmethod
+    def _collect_audio_targets(
+        event: AstrMessageEvent,
+    ) -> list[tuple[Record, str | int | None, bool]]:
+        raw_message = getattr(event.message_obj, "raw_message", None)
+        direct_message_id = None
+        if isinstance(raw_message, dict):
+            direct_message_id = raw_message.get("message_id") or raw_message.get("id")
+        if direct_message_id is None:
+            direct_message_id = getattr(event.message_obj, "message_id", None)
+
+        targets: list[tuple[Record, str | int | None, bool]] = []
+        for comp in event.message_obj.message:
+            if isinstance(comp, Record):
+                targets.append((comp, direct_message_id, False))
+            elif isinstance(comp, Reply) and comp.chain:
+                for reply_comp in comp.chain:
+                    if isinstance(reply_comp, Record):
+                        targets.append((reply_comp, comp.id, True))
+        return targets
+
+    async def _transcribe_with_llonebot(
+        self,
+        event: AstrMessageEvent,
+        audio_targets: list[tuple[Record, str | int | None, bool]],
+    ) -> list[tuple[str, bool]]:
+        bot = getattr(event, "bot", None)
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            logger.warning("[MiMoMedia] 当前 OneBot11 事件不支持 call_action")
+            return []
+
+        transcriptions: list[tuple[str, bool]] = []
+        seen_message_ids: set[str] = set()
+        for _, message_id, is_reply in audio_targets:
+            if message_id is None or not str(message_id).strip():
+                logger.warning("[MiMoMedia] 语音消息缺少 message_id，无法调用 llonebot 转写")
+                continue
+            message_id_key = str(message_id)
+            if message_id_key in seen_message_ids:
+                continue
+            seen_message_ids.add(message_id_key)
+
+            try:
+                api_message_id: str | int = message_id
+                if isinstance(message_id, str) and message_id.isdigit():
+                    api_message_id = int(message_id)
+                result = await call_action(
+                    action="voice_msg_to_text",
+                    message_id=api_message_id,
+                )
+                data = (
+                    result.get("data", result)
+                    if isinstance(result, dict)
+                    else {}
+                )
+                text = data.get("text") if isinstance(data, dict) else None
+                if isinstance(text, str) and text.strip():
+                    transcriptions.append((text.strip(), is_reply))
+                else:
+                    logger.warning(
+                        "[MiMoMedia] llonebot 转写返回空文本，message_id=%s",
+                        message_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MiMoMedia] llonebot 语音转文字失败，message_id=%s: %s",
+                    message_id,
+                    exc,
+                )
+        return transcriptions
+
+    @staticmethod
+    def _inject_llonebot_transcriptions(
+        req: ProviderRequest,
+        transcriptions: list[tuple[str, bool]],
+    ) -> None:
+        for text, is_reply in transcriptions:
+            if is_reply:
+                for part in req.extra_user_content_parts:
+                    if not isinstance(part, TextPart):
+                        continue
+                    if "<Quoted Message>" not in part.text:
+                        continue
+                    if "[Empty Text]" not in part.text:
+                        continue
+                    part.text = part.text.replace("[Empty Text]", text, 1)
+                    break
+                else:
+                    req.extra_user_content_parts.append(TextPart(text=text))
+            else:
+                req.extra_user_content_parts.append(TextPart(text=text))
 
     @staticmethod
     async def _get_record_source(record: Record) -> str:

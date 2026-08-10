@@ -5,6 +5,13 @@
     "default": true,
     "hint": "关闭后插件对所有请求无操作。"
   },
+  "audio_mode": {
+    "description": "音频处理模式",
+    "type": "string",
+    "default": "multimodal",
+    "options": ["multimodal", "llonebot_stt"],
+    "hint": "multimodal：将语音发送给 MiMo 多模态模型；llonebot_stt：调用 llonebot 的 voice_msg_to_text 获取文字，不发送音频。"
+  },
   "video_fps": {
     "description": "视频抽帧帧率 fps",
     "type": "float",

@@ -25,7 +25,7 @@ from astrbot.core.agent.message import (
     TextPart,
     dump_messages_with_checkpoints,
 )
-from astrbot.core.message.components import Record, Video
+from astrbot.core.message.components import Record, Reply, Video
 from astrbot.core.provider.entities import ProviderRequest
 from main import (
     MiMoMediaPlugin,
@@ -338,6 +338,59 @@ def test_replace_empty_text_for_quoted_audio():
         "</Quoted Message>"
     )
     assert req.extra_user_content_parts[1].text == "[Empty Text]"
+
+
+def test_audio_mode_defaults_to_multimodal():
+    assert _plugin()._audio_mode() == "multimodal"
+    assert _plugin({"audio_mode": "llonebot_stt"})._audio_mode() == "llonebot_stt"
+    assert _plugin({"audio_mode": "invalid"})._audio_mode() == "multimodal"
+
+
+class _FakeBot:
+    def __init__(self, text: str = ""):
+        self.text = text
+        self.calls = []
+
+    async def call_action(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"data": {"text": self.text}}
+
+
+@pytest.mark.asyncio
+async def test_llonebot_mode_replaces_quoted_empty_text():
+    plugin = _plugin({"audio_mode": "llonebot_stt"})
+    record = Record(file="quote.amr")
+    reply = Reply(
+        id=456,
+        chain=[record],
+        sender_nickname="Iris-カラーアイリス",
+    )
+    event = _FakeEvent([reply], audio_urls=[])
+    event.bot = _FakeBot("这是语音转写")
+    event.message_obj.raw_message = {"message_id": 999}
+    req = ProviderRequest(
+        extra_user_content_parts=[
+            TextPart(
+                text=(
+                    "<Quoted Message>\n"
+                    "(Iris-カラーアイリス): [Empty Text]\n"
+                    "</Quoted Message>"
+                )
+            ),
+            TextPart(text="[Audio Attachment in quoted message: path quote.amr]"),
+        ]
+    )
+
+    await plugin._handle(event, req)
+
+    assert event.bot.calls == [
+        {"action": "voice_msg_to_text", "message_id": 456}
+    ]
+    texts = [part.text for part in req.extra_user_content_parts if hasattr(part, "text")]
+    assert "这是语音转写" not in texts
+    assert any("(Iris-カラーアイリス): 这是语音转写" in text for text in texts)
+    assert all("Audio Attachment" not in text for text in texts)
+    assert not any(isinstance(part, InputAudioPart) for part in req.extra_user_content_parts)
 
 
 # ---- 插件实例级处理（音频超限/失败提示） ----

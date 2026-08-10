@@ -5,6 +5,7 @@
 ## 功能
 - 用户在对话中发送**视频**：插件自动下载 → 强制重编码为标准 **H264 (libx264) + AAC** 的 MP4 → Base64 上传（`video_url` 内容块，可配 `fps` / `media_resolution`）。
 - 用户在对话中发送**音频/语音**：插件自动转换为标准 **WAV** → Base64 上传（`input_audio` 内容块，`data:` 前缀格式，同 MiMo 官方文档）。
+- 音频可选择发送给 MiMo 多模态模型，或调用 llonebot 的 `voice_msg_to_text` 接口转成文字。
 - 与 AstrBot 图片处理走**同一对话流水线**（`on_llm_request` 钩子），保留人设、会话历史与多轮上下文。
 - 非 MiMo 提供商（或未开启插件）时完全无操作。
 
@@ -21,6 +22,7 @@
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enable` | `true` | 是否启用本插件 |
+| `audio_mode` | `multimodal` | 音频模式：`multimodal` 发送给 MiMo；`llonebot_stt` 调用 llonebot 转文字后发送文字，不发送音频 |
 | `video_fps` | `2.0` | 视频每秒抽帧数，范围 [0.1, 10] |
 | `video_resolution` | `default` | 视频单帧分辨率档次：`default` / `max` |
 | `video_max_base64_mb` | `49` | 视频 Base64 上限（MiMo 要求 ≤50MB），超限先压缩一次 |
@@ -31,6 +33,7 @@
 ## 体积超限策略
 - 视频：先按标准 H264 转码；超过上限则**压缩一次**（缩放 + CRF 28）；仍超限则不再上传，改为向模型注入文本提示“视频过大”，模型会据此回复，请求不会失败。
 - 音频：超过上限则直接注入文本提示“音频过大”，请求不会失败。
+- `llonebot_stt` 模式要求 OneBot 实现支持 llonebot 5.1 的 `voice_msg_to_text` 扩展接口。
 
 ## 说明
 - 插件无新增第三方 Python 依赖；音频与视频都直接调用系统 `ffmpeg` 转码，音频固定输出单声道、16 kHz、16-bit PCM WAV。`MediaResolver` 仅用于将 URL/Base64 音频落盘，不负责格式转换。
