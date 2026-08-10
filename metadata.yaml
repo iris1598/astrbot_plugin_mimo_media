@@ -1,0 +1,7 @@
+name: astrbot_plugin_mimo_media # 插件唯一识别名
+display_name: MiMo 视频/音频多模态 # 展示名
+desc: 为 AstrBot 中的小米 MiMo（mimo-v2.5 系列）补全视频与音频理解能力：自动把视频下载并重编码为标准 H264、音频转为标准 WAV，再以 Base64 上传给 MiMo 进行多模态理解。
+short_desc: 让 MiMo 看懂视频、听懂音频（H264/WAV + Base64）。
+version: v1.0.0
+author: codex
+repo: https://example.com/astrbot_plugin_mimo_media

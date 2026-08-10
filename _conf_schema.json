@@ -1,0 +1,45 @@
+{
+  "enable": {
+    "description": "是否启用本插件",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件对所有请求无操作。"
+  },
+  "video_fps": {
+    "description": "视频抽帧帧率 fps",
+    "type": "float",
+    "default": 2.0,
+    "hint": "MiMo 视频理解的每秒抽帧数，范围 [0.1, 10]。越高时序越精细，Token 越多。"
+  },
+  "video_resolution": {
+    "description": "视频单帧分辨率档次",
+    "type": "string",
+    "default": "default",
+    "options": ["default", "max"],
+    "hint": "default：平衡效果与效率；max：提升对小物体、细节纹理的识别能力。"
+  },
+  "video_max_base64_mb": {
+    "description": "视频 Base64 大小上限（MB）",
+    "type": "float",
+    "default": 49,
+    "hint": "MiMo 要求 Base64 编码字符串不超过 50MB，默认留 1MB 余量。超限会先压缩一次，仍超限则跳过并提示模型。"
+  },
+  "audio_max_base64_mb": {
+    "description": "音频 Base64 大小上限（MB）",
+    "type": "float",
+    "default": 49,
+    "hint": "MiMo 要求 Base64 编码字符串不超过 50MB，默认留 1MB 余量。超限则跳过并提示模型。"
+  },
+  "max_video_width": {
+    "description": "超限时压缩一次的目标宽度（像素）",
+    "type": "int",
+    "default": 1280,
+    "hint": "压缩一次时把视频最长边缩放到该宽度并降低 CRF 到 28。"
+  },
+  "persist_media_to_history": {
+    "description": "是否把媒体写入会话历史",
+    "type": "bool",
+    "default": false,
+    "hint": "默认不写入历史，避免大段 Base64 撑爆数据库；开启后同一会话的多轮追问可保留视频/音频上下文。"
+  }
+}
