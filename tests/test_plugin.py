@@ -316,6 +316,30 @@ def test_drop_placeholders():
     assert req.extra_user_content_parts[0].text == "hello"
 
 
+def test_replace_empty_text_for_quoted_audio():
+    req = ProviderRequest(
+        extra_user_content_parts=[
+            TextPart(
+                text=(
+                    "<Quoted Message>\n"
+                    "(Iris-カラーアイリス): [Empty Text]\n"
+                    "</Quoted Message>"
+                )
+            ),
+            TextPart(text="[Empty Text]"),
+        ],
+    )
+
+    MiMoMediaPlugin._replace_empty_text_for_quoted_audio(req)
+
+    assert req.extra_user_content_parts[0].text == (
+        "<Quoted Message>\n"
+        "(Iris-カラーアイリス): [Audio]\n"
+        "</Quoted Message>"
+    )
+    assert req.extra_user_content_parts[1].text == "[Empty Text]"
+
+
 # ---- 插件实例级处理（音频超限/失败提示） ----
 
 

@@ -244,6 +244,8 @@ class MiMoMediaPlugin(Star):
         request_audio_refs = list(req.audio_urls or [])
         audio_records = self._collect_audio_components(event)
         if audio_records:
+            self._replace_empty_text_for_quoted_audio(req)
+        if audio_records:
             audio_refs = []
             for record in audio_records:
                 source = await self._get_record_source(record)
@@ -438,6 +440,16 @@ class MiMoMediaPlugin(Star):
                 continue
             kept.append(part)
         req.extra_user_content_parts = kept
+
+    @staticmethod
+    def _replace_empty_text_for_quoted_audio(req: ProviderRequest) -> None:
+        """Mark an otherwise empty quoted message as audio when it contains a Record."""
+        for part in req.extra_user_content_parts:
+            if not isinstance(part, TextPart):
+                continue
+            if "<Quoted Message>" not in part.text:
+                continue
+            part.text = part.text.replace("[Empty Text]", "[Audio]")
 
     async def terminate(self):
         """插件卸载/停用时调用。"""
