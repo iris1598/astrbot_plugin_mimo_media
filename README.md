@@ -3,7 +3,7 @@
 为 AstrBot 中的小米 MiMo（`xiaomi_chat_completion`，`mimo-v2.5` 系列）补全**视频**与**音频**多模态理解能力。
 
 ## 功能
-- 用户在对话中发送**视频**：插件自动下载 → 强制重编码为标准 **H264 (libx264) + AAC** 的 MP4 → Base64 上传（`video_url` 内容块，可配 `fps` / `media_resolution`）。
+- 用户在对话中发送**视频**：插件自动下载 → 强制重编码为标准 **H264 (libx264) + AAC** 的 MP4 → 使用 Base64 或 AstrBot 文件服务临时公网链接发送（`video_url` 内容块，可配 `fps` / `media_resolution`）。
 - 用户在对话中发送**音频/语音**：插件自动转换为标准 **WAV** → Base64 上传（`input_audio` 内容块，`data:` 前缀格式，同 MiMo 官方文档）。
 - 支持递归处理引用消息和合并转发中的图片、视频，包括 `Reply`、`Node/Nodes` 以及 OneBot `Forward.id` / 仅有 `Reply.id` 的远程消息。引用图片由 AstrBot 官方逻辑注入，插件只补充顶层合并转发图片，避免重复。
 - 音频可选择发送给 MiMo 多模态模型，或调用 llonebot 的 `voice_msg_to_text` 接口转成文字；`llonebot_stt` 不受当前模型和多模态路由配置影响。
@@ -29,6 +29,7 @@
 | `multimodal_provider_id` | `""` | 路由目标 MiMo provider（WebUI 可直接选择） |
 | `multimodal_route_turns` | `1` | 路由持续轮数，耗尽后自动恢复原模型 |
 | `audio_mode` | `multimodal` | 音频模式：`multimodal` 发送给 MiMo；`llonebot_stt` 在任意当前模型下调用 llonebot 转文字，不发送音频 |
+| `video_transport` | `base64` | 视频传输方式：`base64` 直接写入请求；`astrbot_file_service` 通过 `callback_api_base` 生成临时链接，文件服务不可用时跳过视频 |
 | `video_fps` | `2.0` | 视频每秒抽帧数，范围 [0.1, 10] |
 | `video_max_count` | `3` | 单次实际 LLM 请求最多读取的视频数量，超出只处理前面的项目 |
 | `video_resolution` | `default` | 视频单帧分辨率档次：`default` / `max` |
@@ -39,6 +40,7 @@
 
 ## 体积超限策略
 - 视频：先按标准 H264 转码；超过上限则**压缩一次**（缩放 + CRF 28）；仍超限则不再上传，改为向模型注入文本提示“视频过大”，模型会据此回复，请求不会失败。
+- AstrBot 文件服务模式：转码后的视频通过 `callback_api_base` 暴露为 15 分钟临时链接，MiMo 下载或链接到期后自动清理文件；回调地址未配置或注册失败时跳过视频，不会回退 Base64。该地址必须能被 MiMo 从公网访问。
 - 音频：超过上限则直接注入文本提示“音频过大”，请求不会失败。
 - `llonebot_stt` 仅适用于 OneBot11，并要求实现支持 llonebot 5.1 的 `voice_msg_to_text` 扩展接口；只要插件总开关开启，该模式不依赖 MiMo provider，也不受多模态路由开关、目标 provider 或路由轮数影响。合并转发内部音频不会解析或转写。
 

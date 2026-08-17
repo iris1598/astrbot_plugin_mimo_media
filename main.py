@@ -2,7 +2,8 @@
 
 工作方式：
 - 通过 on_llm_request 钩子，在 MiMo 提供商收到请求前，扫描消息链中的 Video/Record 组件。
-- 视频：下载后强制重编码为标准 H264 (libx264) + AAC 的 MP4，Base64 后以
+- 视频：下载后强制重编码为标准 H264 (libx264) + AAC 的 MP4，可选择 Base64
+  或 AstrBot 文件服务临时公网链接，并以
   {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}, "fps": ..., "media_resolution": ...}
   注入当前请求，与图片处理走同一对话流水线。
 - 音频：取得原始音频后通过系统 FFmpeg 强制转换为标准 WAV，Base64 后以
@@ -27,6 +28,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.agent.message import ContentPart, TextPart
 from astrbot.core.message.components import (
     Forward,
@@ -49,6 +51,10 @@ DEFAULT_MAX_BASE64_MB = 49.0
 DEFAULT_MAX_VIDEO_WIDTH = 1280
 DEFAULT_MAX_VIDEO_COUNT = 3
 DEFAULT_AUDIO_MODE = "multimodal"
+DEFAULT_VIDEO_TRANSPORT = "base64"
+ASTRBOT_FILE_SERVICE_TRANSPORT = "astrbot_file_service"
+FILE_SERVICE_TOKEN_TTL_SECONDS = 15 * 60
+FILE_SERVICE_DOWNLOAD_GRACE_SECONDS = 30
 LLONEBOT_STT_AUDIO_MODE = "llonebot_stt"
 MAX_COMPONENT_DEPTH = 8
 MAX_FORWARD_FETCH = 8
@@ -220,6 +226,8 @@ class MiMoMediaPlugin(Star):
         self.config = config if isinstance(config, dict) else {}
         # Remaining requests in the temporary MiMo routing window, keyed by UMO.
         self._routing_remaining: dict[str, int] = {}
+        self._file_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._served_files: set[str] = set()
 
     def _cfg(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
@@ -257,6 +265,61 @@ class MiMoMediaPlugin(Star):
             )
             return DEFAULT_MAX_VIDEO_COUNT
         return max(1, value)
+
+    def _video_transport(self) -> str:
+        transport = (
+            str(self._cfg("video_transport", DEFAULT_VIDEO_TRANSPORT) or "")
+            .strip()
+            .lower()
+        )
+        if transport not in (
+            DEFAULT_VIDEO_TRANSPORT,
+            ASTRBOT_FILE_SERVICE_TRANSPORT,
+        ):
+            logger.warning(
+                "[MiMoMedia] 无效的 video_transport=%r，使用 Base64",
+                transport,
+            )
+            return DEFAULT_VIDEO_TRANSPORT
+        return transport
+
+    async def _register_video_file(self, path: Path) -> tuple[str, str]:
+        callback_base = str(astrbot_config.get("callback_api_base", "") or "").strip()
+        callback_base = callback_base.rstrip("/")
+        if not callback_base.startswith(("http://", "https://")):
+            raise ValueError("未配置有效的 callback_api_base")
+
+        token = await file_token_service.register_file(
+            str(path),
+            timeout=FILE_SERVICE_TOKEN_TTL_SECONDS,
+        )
+        return f"{callback_base}/api/file/{token}", token
+
+    def _schedule_served_file_cleanup(self, path: Path, token: str) -> None:
+        path_str = str(path)
+        self._served_files.add(path_str)
+
+        async def cleanup_when_consumed() -> None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + FILE_SERVICE_TOKEN_TTL_SECONDS
+            try:
+                while loop.time() < deadline:
+                    await asyncio.sleep(min(5.0, max(0.1, deadline - loop.time())))
+                    if await file_token_service.check_token_expired(token):
+                        # FileResponse may still be opening or streaming the file.
+                        await asyncio.sleep(FILE_SERVICE_DOWNLOAD_GRACE_SECONDS)
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MiMoMedia] 检查视频文件链接状态失败: %s", exc)
+            finally:
+                _cleanup_paths([path_str])
+                self._served_files.discard(path_str)
+
+        task = asyncio.create_task(cleanup_when_consumed())
+        self._file_cleanup_tasks.add(task)
+        task.add_done_callback(self._file_cleanup_tasks.discard)
 
     @staticmethod
     def _session_key(event: AstrMessageEvent) -> str:
@@ -903,6 +966,42 @@ class MiMoMediaPlugin(Star):
             out = await _to_h264_mp4(src)
             cleanup_paths.append(str(out))
 
+            if self._video_transport() == ASTRBOT_FILE_SERVICE_TRANSPORT:
+                try:
+                    public_url, token = await self._register_video_file(out)
+                    self._schedule_served_file_cleanup(out, token)
+                    cleanup_paths.remove(str(out))
+
+                    fps = float(self._cfg("video_fps", DEFAULT_FPS))
+                    fps = max(0.1, min(10.0, fps))
+                    resolution = str(self._cfg("video_resolution", DEFAULT_RESOLUTION))
+                    if resolution not in ("default", "max"):
+                        resolution = DEFAULT_RESOLUTION
+
+                    logger.info(
+                        "[MiMoMedia] 已通过 AstrBot 文件服务提供视频，链接有效期 %d 秒",
+                        FILE_SERVICE_TOKEN_TTL_SECONDS,
+                    )
+                    return (
+                        VideoURLPart(
+                            video_url=VideoURLPart.VideoURL(url=public_url),
+                            fps=fps,
+                            media_resolution=resolution,
+                        ),
+                        None,
+                        cleanup_paths,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[MiMoMedia] AstrBot 文件服务不可用，视频已跳过: %s",
+                        exc,
+                    )
+                    return (
+                        None,
+                        "[AstrBot 文件服务不可用，视频已跳过]",
+                        cleanup_paths,
+                    )
+
             max_mb = float(self._cfg("video_max_base64_mb", DEFAULT_MAX_BASE64_MB))
             data_url = _bytes_to_data_url(out.read_bytes(), VIDEO_MIME)
             if _base64_size_mb(data_url) > max_mb:
@@ -1001,3 +1100,11 @@ class MiMoMediaPlugin(Star):
     async def terminate(self):
         """插件卸载/停用时调用。"""
         self._routing_remaining.clear()
+        tasks = list(self._file_cleanup_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._file_cleanup_tasks.clear()
+        _cleanup_paths(list(self._served_files))
+        self._served_files.clear()

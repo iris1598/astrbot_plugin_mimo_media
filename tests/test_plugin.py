@@ -461,6 +461,62 @@ async def test_process_video_success(sample_video: Path):
 
 
 @pytest.mark.asyncio
+async def test_process_video_uses_astrbot_file_service(sample_video: Path, monkeypatch):
+    class FakeFileTokenService:
+        def __init__(self):
+            self.registered_path = None
+            self.timeout = None
+
+        async def register_file(self, path, timeout=None):
+            self.registered_path = path
+            self.timeout = timeout
+            return "video-token"
+
+        async def check_token_expired(self, token):
+            return False
+
+    fake_service = FakeFileTokenService()
+    monkeypatch.setattr(
+        main,
+        "astrbot_config",
+        {"callback_api_base": "https://bot.example.com/"},
+    )
+    monkeypatch.setattr(main, "file_token_service", fake_service)
+    plugin = _plugin({"video_transport": "astrbot_file_service"})
+    video = Video.fromFileSystem(path=str(sample_video))
+
+    part, note, paths = await plugin._process_video(video)
+    served_path = Path(fake_service.registered_path)
+    try:
+        assert note is None
+        assert part.video_url.url == ("https://bot.example.com/api/file/video-token")
+        assert fake_service.timeout == main.FILE_SERVICE_TOKEN_TTL_SECONDS
+        assert str(served_path) not in paths
+        assert served_path.exists()
+    finally:
+        main._cleanup_paths(paths)
+        await plugin.terminate()
+
+    assert not served_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_process_video_file_service_failure_skips_video(
+    sample_video: Path, monkeypatch
+):
+    monkeypatch.setattr(main, "astrbot_config", {"callback_api_base": ""})
+    plugin = _plugin({"video_transport": "astrbot_file_service"})
+    video = Video.fromFileSystem(path=str(sample_video))
+
+    part, note, paths = await plugin._process_video(video)
+    try:
+        assert part is None
+        assert note is not None and "文件服务不可用" in note
+    finally:
+        main._cleanup_paths(paths)
+
+
+@pytest.mark.asyncio
 async def test_process_video_oversize_two_pass_then_note(sample_video: Path):
     plugin = _plugin({"video_max_base64_mb": 0.0001, "max_video_width": 64})
     video = Video.fromFileSystem(path=str(sample_video))

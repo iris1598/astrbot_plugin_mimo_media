@@ -31,6 +31,13 @@
     "options": ["multimodal", "llonebot_stt"],
     "hint": "multimodal：将直接发送或普通引用的语音发送给 MiMo；llonebot_stt：始终调用 OneBot11 llonebot 的 voice_msg_to_text 获取文字，不受当前模型和多模态路由设置影响。合并转发内部音频不解析。"
   },
+  "video_transport": {
+    "description": "视频传输方式",
+    "type": "string",
+    "default": "base64",
+    "options": ["base64", "astrbot_file_service"],
+    "hint": "base64：将转码后的视频直接放入模型请求；astrbot_file_service：使用 callback_api_base 生成临时公网链接供 MiMo 下载，文件服务不可用时跳过视频。"
+  },
   "video_fps": {
     "description": "视频抽帧帧率 fps",
     "type": "float",
