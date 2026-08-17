@@ -5,24 +5,31 @@
     "default": true,
     "hint": "关闭后插件对所有请求无操作。"
   },
-  "multimodal_routing_enabled": {
-    "description": "启用多模态消息临时路由",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，包含图片、视频或音频的消息会临时路由到下方配置的 MiMo provider；关闭时保留原有逻辑。"
+  "multimodal_mode": {
+    "description": "多模态处理模式",
+    "type": "string",
+    "default": "direct",
+    "options": ["direct", "route", "caption"],
+    "hint": "direct（直通）：仅在当前对话模型是 MiMo 时直接发送视频/音频；route（路由）：含图片、视频或音频的消息临时改用 MiMo；caption（转述）：MiMo 只转述视频/音频，再把文字交给原对话模型，图片继续使用 AstrBot 官方图片转述。"
   },
   "multimodal_provider_id": {
-    "description": "多模态路由目标 MiMo provider",
+    "description": "MiMo provider",
     "type": "string",
     "_special": "select_provider",
     "default": "",
-    "hint": "选择已配置的 MiMo provider。路由只对当前会话临时生效，不会修改 AstrBot 的全局模型。"
+    "hint": "路由模式用作临时对话模型，转述模式用作视频/音频理解模型；请选择已配置的 MiMo provider。"
   },
   "multimodal_route_turns": {
     "description": "多模态路由持续轮数",
     "type": "int",
     "default": 1,
     "hint": "默认只使用 MiMo 处理实际触发 LLM 的多模态请求这一轮；设置更大值时，后续实际触发 LLM 的对话轮数也会继续使用 MiMo，耗尽后自动恢复原模型。未触发 LLM 的消息不计入轮数。"
+  },
+  "media_caption_prompt": {
+    "description": "视频/音频转述提示词",
+    "type": "text",
+    "default": "请详细转述视频和音频中的内容，包括画面、对话、声音和关键事件。",
+    "hint": "仅在转述模式下使用。MiMo 的结果会以 media_caption 文本注入原对话模型。"
   },
   "audio_mode": {
     "description": "音频处理模式",

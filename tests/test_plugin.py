@@ -560,9 +560,14 @@ class _FakeProvider:
     def __init__(self, model="text-model", provider_type="openai_chat_completion"):
         self.model = model
         self.provider_config = {"type": provider_type, "api_base": ""}
+        self.chat_calls = []
 
     def get_model(self):
         return self.model
+
+    async def text_chat(self, **kwargs):
+        self.chat_calls.append(kwargs)
+        return type("Response", (), {"completion_text": "媒体转述结果"})()
 
 
 class _FakeContext:
@@ -670,7 +675,7 @@ async def test_forward_id_resolves_remote_multimodal_components_for_routing():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
         },
         context=context,
@@ -709,7 +714,7 @@ async def test_reply_images_are_not_duplicated_by_plugin():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
         },
         context=context,
@@ -794,7 +799,7 @@ async def test_routing_disabled_preserves_original_logic():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": False,
+            "multimodal_mode": "direct",
             "multimodal_provider_id": "mimo",
         },
         context=context,
@@ -807,12 +812,77 @@ async def test_routing_disabled_preserves_original_logic():
     assert plugin._routing_remaining == {}
 
 
+def test_multimodal_mode_supports_new_values_and_legacy_routing_switch():
+    assert _plugin()._multimodal_mode() == "direct"
+    assert _plugin({"multimodal_mode": "route"})._multimodal_mode() == "route"
+    assert _plugin({"multimodal_mode": "caption"})._multimodal_mode() == "caption"
+    assert _plugin({"multimodal_routing_enabled": True})._multimodal_mode() == "route"
+
+
+@pytest.mark.asyncio
+async def test_caption_mode_injects_media_caption_without_routing_images(monkeypatch):
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_mode": "caption",
+            "multimodal_provider_id": "mimo",
+            "media_caption_prompt": "转述这些媒体",
+        },
+        context=context,
+    )
+    event = _FakeEvent([Image(file="official.jpg"), Video(file="video.mp4")])
+    req = ProviderRequest(
+        image_urls=["official.jpg"],
+        extra_user_content_parts=[
+            TextPart(text="[Video Attachment: name video.mp4, path video.mp4]")
+        ],
+    )
+
+    async def fake_handle(event, caption_req, **kwargs):
+        caption_req.extra_user_content_parts.append(
+            VideoURLPart(
+                video_url=VideoURLPart.VideoURL(url="data:video/mp4;base64,AAAA")
+            )
+        )
+
+    monkeypatch.setattr(plugin, "_handle", fake_handle)
+    monkeypatch.setattr(main, "Provider", _FakeProvider)
+
+    await plugin._caption_media(event, req, process_audio=True)
+
+    assert req.image_urls == ["official.jpg"]
+    assert context.providers["mimo"].chat_calls[0]["prompt"] == "转述这些媒体"
+    assert all(
+        not isinstance(part, VideoURLPart) for part in req.extra_user_content_parts
+    )
+    assert [part.text for part in req.extra_user_content_parts] == [
+        "<media_caption>媒体转述结果</media_caption>"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_caption_mode_does_not_route_image_only_messages():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_mode": "caption",
+            "multimodal_provider_id": "mimo",
+        },
+        context=context,
+    )
+    event = _FakeEvent([Image(file="image.jpg")])
+
+    await plugin.prepare_multimodal_routing(event)
+
+    assert event.get_extra("selected_provider") is None
+
+
 @pytest.mark.asyncio
 async def test_cancelled_multimodal_llm_does_not_start_routing_window():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
             "multimodal_route_turns": 3,
         },
@@ -835,7 +905,7 @@ async def test_default_routing_only_selects_mimo_for_triggered_llm():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
         },
         context=context,
@@ -858,7 +928,7 @@ async def test_configured_routing_turns_then_returns_to_original_provider():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
             "multimodal_route_turns": 3,
         },
@@ -890,7 +960,7 @@ async def test_message_without_llm_does_not_consume_active_routing_window():
     context = _FakeContext()
     plugin = _plugin(
         {
-            "multimodal_routing_enabled": True,
+            "multimodal_mode": "route",
             "multimodal_provider_id": "mimo",
             "multimodal_route_turns": 2,
         },

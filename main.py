@@ -10,7 +10,8 @@
   {"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,..."}}
   注入（MiMo 要求 data 携带 data: 前缀、不含 format 字段）。
 - llonebot_stt 会在任意当前模型下执行；其他媒体处理仍只对 MiMo 生效。
-- 路由开启后，多模态消息会临时选择配置的 MiMo 提供商。
+- 支持直通、路由和转述三种模式；转述模式只处理视频/音频，图片继续使用
+  AstrBot 官方图片转述功能。
 """
 
 import asyncio
@@ -28,7 +29,7 @@ from pydantic import BaseModel
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import Provider, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.agent.message import ContentPart, TextPart
@@ -54,6 +55,9 @@ DEFAULT_MAX_VIDEO_WIDTH = 1280
 DEFAULT_MAX_VIDEO_COUNT = 3
 DEFAULT_AUDIO_MODE = "multimodal"
 DEFAULT_VIDEO_TRANSPORT = "base64"
+DEFAULT_MULTIMODAL_MODE = "direct"
+ROUTE_MULTIMODAL_MODE = "route"
+CAPTION_MULTIMODAL_MODE = "caption"
 ASTRBOT_FILE_SERVICE_TRANSPORT = "astrbot_file_service"
 FILE_SERVICE_TOKEN_TTL_SECONDS = 15 * 60
 LLONEBOT_STT_AUDIO_MODE = "llonebot_stt"
@@ -243,8 +247,29 @@ class MiMoMediaPlugin(Star):
     def _enabled(self) -> bool:
         return bool(self._cfg("enable", True))
 
+    def _multimodal_mode(self) -> str:
+        raw_mode = self._cfg("multimodal_mode", None)
+        if raw_mode is None:
+            return (
+                ROUTE_MULTIMODAL_MODE
+                if bool(self._cfg("multimodal_routing_enabled", False))
+                else DEFAULT_MULTIMODAL_MODE
+            )
+        mode = str(raw_mode or "").strip().lower()
+        if mode not in (
+            DEFAULT_MULTIMODAL_MODE,
+            ROUTE_MULTIMODAL_MODE,
+            CAPTION_MULTIMODAL_MODE,
+        ):
+            logger.warning(
+                "[MiMoMedia] 无效的 multimodal_mode=%r，使用直通模式",
+                raw_mode,
+            )
+            return DEFAULT_MULTIMODAL_MODE
+        return mode
+
     def _routing_enabled(self) -> bool:
-        return bool(self._cfg("multimodal_routing_enabled", False))
+        return self._multimodal_mode() == ROUTE_MULTIMODAL_MODE
 
     def _routing_provider_id(self) -> str:
         return str(self._cfg("multimodal_provider_id", "") or "").strip()
@@ -663,21 +688,23 @@ class MiMoMediaPlugin(Star):
 
         req.image_urls = image_urls
 
-    def _target_provider_available(self) -> bool:
+    def _target_provider_available(self, purpose: str = "路由") -> bool:
         target_id = self._routing_provider_id()
         if not target_id:
-            logger.warning("[MiMoMedia] 未配置多模态路由目标 MiMo provider")
+            logger.warning("[MiMoMedia] 未配置用于%s的 MiMo provider", purpose)
             return False
         provider = self.context.get_provider_by_id(target_id)
         if provider is None:
             logger.error(
-                "[MiMoMedia] 多模态路由目标 provider %r 不存在，请检查插件配置",
+                "[MiMoMedia] 用于%s的 provider %r 不存在，请检查插件配置",
+                purpose,
                 target_id,
             )
             return False
         if not self._provider_is_mimo(provider):
             logger.error(
-                "[MiMoMedia] 多模态路由目标 provider %r 不是 MiMo provider",
+                "[MiMoMedia] 用于%s的 provider %r 不是 MiMo provider",
+                purpose,
                 target_id,
             )
             return False
@@ -780,6 +807,7 @@ class MiMoMediaPlugin(Star):
         try:
             if not self._enabled():
                 return
+            mode = self._multimodal_mode()
             if event.get_extra("mimo_media_routed") and not event.get_extra(
                 "mimo_media_route_consumed"
             ):
@@ -800,6 +828,20 @@ class MiMoMediaPlugin(Star):
                 )
             is_mimo_provider = self._is_mimo_provider(event)
             audio_mode = self._audio_mode()
+            if mode == CAPTION_MULTIMODAL_MODE:
+                await self._resolve_remote_media(event)
+                if audio_mode == LLONEBOT_STT_AUDIO_MODE:
+                    await self._handle(
+                        event,
+                        req,
+                        process_videos=False,
+                    )
+                await self._caption_media(
+                    event,
+                    req,
+                    process_audio=audio_mode == DEFAULT_AUDIO_MODE,
+                )
+                return
             if audio_mode != LLONEBOT_STT_AUDIO_MODE and not is_mimo_provider:
                 return
             if is_mimo_provider or audio_mode == LLONEBOT_STT_AUDIO_MODE:
@@ -816,10 +858,11 @@ class MiMoMediaPlugin(Star):
         req: ProviderRequest,
         *,
         process_videos: bool = True,
+        process_audio: bool = True,
     ) -> None:
         videos = self._collect_video_components(event) if process_videos else []
-        request_audio_refs = list(req.audio_urls or [])
-        audio_targets = self._collect_audio_targets(event)
+        request_audio_refs = list(req.audio_urls or []) if process_audio else []
+        audio_targets = self._collect_audio_targets(event) if process_audio else []
         audio_records = [record for record, _, _ in audio_targets]
         audio_mode = self._audio_mode()
         audio_refs: list[str] = []
@@ -909,6 +952,77 @@ class MiMoMediaPlugin(Star):
 
         # 5. 清理插件创建的临时文件（下载源 + 转码产物）
         _cleanup_paths(cleanup_paths)
+
+    async def _caption_media(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        *,
+        process_audio: bool,
+    ) -> None:
+        """Use the configured MiMo provider to caption video and audio as text."""
+        videos = self._collect_video_components(event)
+        has_audio = bool(self._collect_audio_targets(event) or req.audio_urls)
+        if not videos and (not process_audio or not has_audio):
+            return
+
+        caption_req = ProviderRequest(
+            prompt=str(
+                self._cfg(
+                    "media_caption_prompt",
+                    "请详细转述视频和音频中的内容，包括画面、对话、声音和关键事件。",
+                )
+            ),
+            audio_urls=list(req.audio_urls or []),
+            extra_user_content_parts=[],
+        )
+        await self._handle(
+            event,
+            caption_req,
+            process_videos=True,
+            process_audio=process_audio,
+        )
+        media_parts = [
+            part
+            for part in caption_req.extra_user_content_parts
+            if isinstance(part, (VideoURLPart, InputAudioPart))
+        ]
+        notes = [
+            part
+            for part in caption_req.extra_user_content_parts
+            if isinstance(part, TextPart) and part.text.startswith("[")
+        ]
+        self._drop_placeholders(req, drop_video=True)
+        req.audio_urls = []
+        if not media_parts:
+            req.extra_user_content_parts.extend(notes)
+            return
+        req.extra_user_content_parts.extend(notes)
+        if not self._target_provider_available("转述"):
+            req.extra_user_content_parts.append(TextPart(text="[视频/音频转述失败]"))
+            return
+
+        provider = self.context.get_provider_by_id(self._routing_provider_id())
+        if not isinstance(provider, Provider):
+            req.extra_user_content_parts.append(TextPart(text="[视频/音频转述失败]"))
+            return
+        try:
+            response = await provider.text_chat(
+                prompt=caption_req.prompt,
+                extra_user_content_parts=media_parts,
+            )
+            caption = str(response.completion_text or "").strip()
+            if caption:
+                req.extra_user_content_parts.append(
+                    TextPart(text=f"<media_caption>{caption}</media_caption>")
+                )
+            else:
+                req.extra_user_content_parts.append(
+                    TextPart(text="[视频/音频转述失败]")
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[MiMoMedia] 视频/音频转述失败: %s", exc, exc_info=True)
+            req.extra_user_content_parts.append(TextPart(text="[视频/音频转述失败]"))
 
     @classmethod
     def _collect_video_components(cls, event: AstrMessageEvent) -> list[Video]:
