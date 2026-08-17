@@ -18,6 +18,8 @@ import base64
 import json
 import os
 import subprocess
+import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -54,10 +56,14 @@ DEFAULT_AUDIO_MODE = "multimodal"
 DEFAULT_VIDEO_TRANSPORT = "base64"
 ASTRBOT_FILE_SERVICE_TRANSPORT = "astrbot_file_service"
 FILE_SERVICE_TOKEN_TTL_SECONDS = 15 * 60
-FILE_SERVICE_DOWNLOAD_GRACE_SECONDS = 30
 LLONEBOT_STT_AUDIO_MODE = "llonebot_stt"
 MAX_COMPONENT_DEPTH = 8
 MAX_FORWARD_FETCH = 8
+
+_FILE_REGISTRY_ATTR = "_mimo_media_reusable_video_files"
+_FILE_HANDLER_ATTR = "_mimo_media_original_handle_file"
+_FILE_WRAPPER_ATTR = "_mimo_media_handle_file_wrapper"
+_FILE_OWNERS_ATTR = "_mimo_media_file_handler_owners"
 
 VIDEO_MIME = "video/mp4"
 AUDIO_MIME = "audio/wav"
@@ -228,6 +234,8 @@ class MiMoMediaPlugin(Star):
         self._routing_remaining: dict[str, int] = {}
         self._file_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._served_files: set[str] = set()
+        self._file_tokens: set[str] = set()
+        self._file_handler_owner_registered = False
 
     def _cfg(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
@@ -283,41 +291,109 @@ class MiMoMediaPlugin(Star):
             return DEFAULT_VIDEO_TRANSPORT
         return transport
 
+    def _ensure_reusable_file_handler(self) -> None:
+        if not hasattr(file_token_service, _FILE_REGISTRY_ATTR):
+            setattr(file_token_service, _FILE_REGISTRY_ATTR, {})
+        if not hasattr(file_token_service, _FILE_OWNERS_ATTR):
+            setattr(file_token_service, _FILE_OWNERS_ATTR, set())
+
+        if not hasattr(file_token_service, _FILE_HANDLER_ATTR):
+            original_handler = file_token_service.handle_file
+
+            async def reusable_handle_file(file_token: str) -> str:
+                registry = getattr(file_token_service, _FILE_REGISTRY_ATTR, {})
+                entry = registry.get(file_token)
+                if entry is not None:
+                    file_path, expires_at, access_count = entry
+                    if expires_at < time.time():
+                        registry.pop(file_token, None)
+                        raise KeyError(f"Invalid or expired file token: {file_token}")
+                    if not os.path.exists(file_path):
+                        registry.pop(file_token, None)
+                        raise FileNotFoundError(f"File does not exist: {file_path}")
+                    access_count += 1
+                    registry[file_token] = (file_path, expires_at, access_count)
+                    logger.info(
+                        "[MiMoMedia] 文件服务视频被拉取，第 %d 次，token=%s...",
+                        access_count,
+                        file_token[:8],
+                    )
+                    return file_path
+
+                original = getattr(file_token_service, _FILE_HANDLER_ATTR)
+                return await original(file_token)
+
+            setattr(file_token_service, _FILE_HANDLER_ATTR, original_handler)
+            setattr(file_token_service, _FILE_WRAPPER_ATTR, reusable_handle_file)
+            file_token_service.handle_file = reusable_handle_file
+
+        if not self._file_handler_owner_registered:
+            owners = getattr(file_token_service, _FILE_OWNERS_ATTR)
+            owners.add(id(self))
+            self._file_handler_owner_registered = True
+
+    def _release_reusable_file_handler(self) -> None:
+        if not self._file_handler_owner_registered:
+            return
+        owners = getattr(file_token_service, _FILE_OWNERS_ATTR, set())
+        owners.discard(id(self))
+        self._file_handler_owner_registered = False
+        if owners:
+            return
+
+        wrapper = getattr(file_token_service, _FILE_WRAPPER_ATTR, None)
+        original_handler = getattr(file_token_service, _FILE_HANDLER_ATTR, None)
+        if wrapper is not None and file_token_service.handle_file is wrapper:
+            file_token_service.handle_file = original_handler
+        for attr in (
+            _FILE_REGISTRY_ATTR,
+            _FILE_HANDLER_ATTR,
+            _FILE_WRAPPER_ATTR,
+            _FILE_OWNERS_ATTR,
+        ):
+            try:
+                delattr(file_token_service, attr)
+            except AttributeError:
+                pass
+
     async def _register_video_file(self, path: Path) -> tuple[str, str]:
         callback_base = str(astrbot_config.get("callback_api_base", "") or "").strip()
         callback_base = callback_base.rstrip("/")
         if not callback_base.startswith(("http://", "https://")):
             raise ValueError("未配置有效的 callback_api_base")
 
-        token = await file_token_service.register_file(
+        self._ensure_reusable_file_handler()
+        token = str(uuid.uuid4())
+        registry = getattr(file_token_service, _FILE_REGISTRY_ATTR)
+        registry[token] = (
             str(path),
-            timeout=FILE_SERVICE_TOKEN_TTL_SECONDS,
+            time.time() + FILE_SERVICE_TOKEN_TTL_SECONDS,
+            0,
         )
+        self._file_tokens.add(token)
         return f"{callback_base}/api/file/{token}", token
+
+    def _remove_file_token(self, token: str) -> None:
+        registry = getattr(file_token_service, _FILE_REGISTRY_ATTR, None)
+        if isinstance(registry, dict):
+            registry.pop(token, None)
+        self._file_tokens.discard(token)
 
     def _schedule_served_file_cleanup(self, path: Path, token: str) -> None:
         path_str = str(path)
         self._served_files.add(path_str)
 
-        async def cleanup_when_consumed() -> None:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + FILE_SERVICE_TOKEN_TTL_SECONDS
+        async def cleanup_after_ttl() -> None:
             try:
-                while loop.time() < deadline:
-                    await asyncio.sleep(min(5.0, max(0.1, deadline - loop.time())))
-                    if await file_token_service.check_token_expired(token):
-                        # FileResponse may still be opening or streaming the file.
-                        await asyncio.sleep(FILE_SERVICE_DOWNLOAD_GRACE_SECONDS)
-                        break
+                await asyncio.sleep(FILE_SERVICE_TOKEN_TTL_SECONDS)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[MiMoMedia] 检查视频文件链接状态失败: %s", exc)
             finally:
+                self._remove_file_token(token)
                 _cleanup_paths([path_str])
                 self._served_files.discard(path_str)
 
-        task = asyncio.create_task(cleanup_when_consumed())
+        task = asyncio.create_task(cleanup_after_ttl())
         self._file_cleanup_tasks.add(task)
         task.add_done_callback(self._file_cleanup_tasks.discard)
 
@@ -1106,5 +1182,8 @@ class MiMoMediaPlugin(Star):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._file_cleanup_tasks.clear()
+        for token in list(self._file_tokens):
+            self._remove_file_token(token)
         _cleanup_paths(list(self._served_files))
         self._served_files.clear()
+        self._release_reusable_file_handler()

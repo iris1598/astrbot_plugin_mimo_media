@@ -463,17 +463,8 @@ async def test_process_video_success(sample_video: Path):
 @pytest.mark.asyncio
 async def test_process_video_uses_astrbot_file_service(sample_video: Path, monkeypatch):
     class FakeFileTokenService:
-        def __init__(self):
-            self.registered_path = None
-            self.timeout = None
-
-        async def register_file(self, path, timeout=None):
-            self.registered_path = path
-            self.timeout = timeout
-            return "video-token"
-
-        async def check_token_expired(self, token):
-            return False
+        async def handle_file(self, token):
+            raise KeyError(token)
 
     fake_service = FakeFileTokenService()
     monkeypatch.setattr(
@@ -486,11 +477,12 @@ async def test_process_video_uses_astrbot_file_service(sample_video: Path, monke
     video = Video.fromFileSystem(path=str(sample_video))
 
     part, note, paths = await plugin._process_video(video)
-    served_path = Path(fake_service.registered_path)
+    token = part.video_url.url.rsplit("/", 1)[-1]
+    served_path = Path(await fake_service.handle_file(token))
     try:
         assert note is None
-        assert part.video_url.url == ("https://bot.example.com/api/file/video-token")
-        assert fake_service.timeout == main.FILE_SERVICE_TOKEN_TTL_SECONDS
+        assert part.video_url.url.startswith("https://bot.example.com/api/file/")
+        assert await fake_service.handle_file(token) == str(served_path)
         assert str(served_path) not in paths
         assert served_path.exists()
     finally:
