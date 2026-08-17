@@ -29,13 +29,19 @@
     "type": "string",
     "default": "multimodal",
     "options": ["multimodal", "llonebot_stt"],
-    "hint": "multimodal：将语音发送给 MiMo 多模态模型；llonebot_stt：始终调用 llonebot 的 voice_msg_to_text 获取文字，不受当前模型和多模态路由设置影响，也不会发送音频。"
+    "hint": "multimodal：将直接发送或普通引用的语音发送给 MiMo；llonebot_stt：始终调用 OneBot11 llonebot 的 voice_msg_to_text 获取文字，不受当前模型和多模态路由设置影响。合并转发内部音频不解析。"
   },
   "video_fps": {
     "description": "视频抽帧帧率 fps",
     "type": "float",
     "default": 2.0,
     "hint": "MiMo 视频理解的每秒抽帧数，范围 [0.1, 10]。越高时序越精细，Token 越多。"
+  },
+  "video_max_count": {
+    "description": "单次最多读取视频数量",
+    "type": "int",
+    "default": 3,
+    "hint": "限制一条实际 LLM 请求中读取的视频数量，包含直接发送、引用消息和合并转发中的视频。超出时只处理前面的项目，并向模型附加截断提示。"
   },
   "video_resolution": {
     "description": "视频单帧分辨率档次",

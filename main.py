@@ -14,8 +14,10 @@
 
 import asyncio
 import base64
+import json
 import os
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,17 +28,30 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import ContentPart, TextPart
-from astrbot.core.message.components import Image, Record, Reply, Video
+from astrbot.core.message.components import (
+    Forward,
+    Image,
+    Node,
+    Nodes,
+    Record,
+    Reply,
+    Video,
+)
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.datetime_utils import generate_timestamp_id
 from astrbot.core.utils.media_utils import MediaResolver
+from astrbot.core.utils.quoted_message import extract_quoted_message_images
+from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
 
 DEFAULT_FPS = 2.0
 DEFAULT_RESOLUTION = "default"
 DEFAULT_MAX_BASE64_MB = 49.0
 DEFAULT_MAX_VIDEO_WIDTH = 1280
+DEFAULT_MAX_VIDEO_COUNT = 3
 DEFAULT_AUDIO_MODE = "multimodal"
 LLONEBOT_STT_AUDIO_MODE = "llonebot_stt"
+MAX_COMPONENT_DEPTH = 8
+MAX_FORWARD_FETCH = 8
 
 VIDEO_MIME = "video/mp4"
 AUDIO_MIME = "audio/wav"
@@ -230,6 +245,19 @@ class MiMoMediaPlugin(Star):
             return 1
         return max(1, value)
 
+    def _max_video_count(self) -> int:
+        raw_value = self._cfg("video_max_count", DEFAULT_MAX_VIDEO_COUNT)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[MiMoMedia] 无效的 video_max_count=%r，使用默认值 %d",
+                raw_value,
+                DEFAULT_MAX_VIDEO_COUNT,
+            )
+            return DEFAULT_MAX_VIDEO_COUNT
+        return max(1, value)
+
     @staticmethod
     def _session_key(event: AstrMessageEvent) -> str:
         return str(
@@ -239,21 +267,262 @@ class MiMoMediaPlugin(Star):
             or "default"
         )
 
-    @staticmethod
-    def _message_components(event: AstrMessageEvent) -> list[Any]:
-        components: list[Any] = []
-        message_obj = getattr(event, "message_obj", None)
-        for component in getattr(message_obj, "message", []) or []:
-            components.append(component)
+    @classmethod
+    def _walk_components(
+        cls,
+        components: list[Any] | None,
+        *,
+        reply_id: str | int | None = None,
+        in_forward: bool = False,
+        depth: int = 0,
+    ) -> Iterator[tuple[Any, str | int | None, bool]]:
+        """Recursively walk reply and forwarded-message component containers."""
+        if not isinstance(components, list) or depth > MAX_COMPONENT_DEPTH:
+            return
+        for component in components:
+            yield component, reply_id, in_forward
             if isinstance(component, Reply) and component.chain:
-                components.extend(component.chain)
-        return components
+                yield from cls._walk_components(
+                    component.chain,
+                    reply_id=component.id,
+                    in_forward=in_forward,
+                    depth=depth + 1,
+                )
+            elif isinstance(component, Node):
+                yield from cls._walk_components(
+                    component.content,
+                    reply_id=reply_id,
+                    in_forward=True,
+                    depth=depth + 1,
+                )
+            elif isinstance(component, Nodes):
+                for node in component.nodes:
+                    yield node, reply_id, True
+                    yield from cls._walk_components(
+                        node.content,
+                        reply_id=reply_id,
+                        in_forward=True,
+                        depth=depth + 1,
+                    )
+
+    @classmethod
+    def _component_entries(
+        cls, event: AstrMessageEvent
+    ) -> list[tuple[Any, str | int | None, bool]]:
+        message_obj = getattr(event, "message_obj", None)
+        entries = list(cls._walk_components(getattr(message_obj, "message", []) or []))
+        entries.extend(event.get_extra("mimo_media_remote_entries") or [])
+        return entries
+
+    @classmethod
+    def _message_components(cls, event: AstrMessageEvent) -> list[Any]:
+        return [component for component, _, _ in cls._component_entries(event)]
+
+    @classmethod
+    def _parse_forward_payload(
+        cls, payload: Any, *, include_audio: bool
+    ) -> tuple[list[Image | Video | Record], list[str]]:
+        """Extract media components and nested forward IDs from OneBot payloads."""
+        media: list[Image | Video | Record] = []
+        forward_ids: list[str] = []
+        seen_media: set[tuple[str, str]] = set()
+
+        def visit(value: Any, depth: int = 0, in_forward: bool = False) -> None:
+            if depth > MAX_COMPONENT_DEPTH:
+                return
+            if isinstance(value, list):
+                for item in value:
+                    visit(item, depth + 1, in_forward)
+                return
+            if not isinstance(value, dict):
+                return
+
+            segment_type = str(value.get("type", "") or "").lower()
+            segment_data = value.get("data")
+            data = segment_data if isinstance(segment_data, dict) else value
+            source = str(
+                data.get("url") or data.get("file") or data.get("path") or ""
+            ).strip()
+            if segment_type in ("image", "img") and source:
+                key = ("image", source)
+                if key not in seen_media:
+                    seen_media.add(key)
+                    media.append(
+                        Image(
+                            file=source,
+                            url=str(data.get("url") or ""),
+                            path=str(data.get("path") or ""),
+                        )
+                    )
+                return
+            if segment_type in ("video", "shortvideo") and source:
+                key = ("video", source)
+                if key not in seen_media:
+                    seen_media.add(key)
+                    media.append(
+                        Video(
+                            file=source,
+                            url=str(data.get("url") or ""),
+                            path=str(data.get("path") or ""),
+                        )
+                    )
+                return
+            if (
+                include_audio
+                and not in_forward
+                and segment_type in ("record", "audio", "voice")
+                and source
+            ):
+                key = ("record", source)
+                if key not in seen_media:
+                    seen_media.add(key)
+                    media.append(
+                        Record(
+                            file=source,
+                            url=str(data.get("url") or ""),
+                            path=str(data.get("path") or ""),
+                        )
+                    )
+                return
+            if segment_type in ("forward", "forward_msg", "nodes"):
+                forward_id = data.get("id") or data.get("message_id")
+                if forward_id is not None and str(forward_id).strip():
+                    forward_ids.append(str(forward_id).strip())
+
+            containers = [value]
+            if data is not value:
+                containers.append(data)
+            nested_in_forward = in_forward or segment_type in ("node", "nodes")
+            for container in containers:
+                for key in ("messages", "message", "nodes", "content"):
+                    nested = container.get(key)
+                    if isinstance(nested, (list, dict)):
+                        visit(nested, depth + 1, nested_in_forward)
+                    elif isinstance(nested, str) and nested.strip().startswith(
+                        ("[", "{")
+                    ):
+                        try:
+                            visit(json.loads(nested), depth + 1, nested_in_forward)
+                        except json.JSONDecodeError:
+                            pass
+
+        visit(payload)
+        return media, list(dict.fromkeys(forward_ids))
+
+    async def _resolve_remote_media(self, event: AstrMessageEvent) -> None:
+        """Resolve media omitted from Reply chains and Forward ID components."""
+        if event.get_extra("mimo_media_remote_resolved"):
+            return
+        event.set_extra("mimo_media_remote_resolved", True)
+
+        local_entries = list(
+            self._walk_components(
+                getattr(getattr(event, "message_obj", None), "message", []) or []
+            )
+        )
+        forward_refs = [
+            (str(component.id).strip(), reply_id)
+            for component, reply_id, _ in local_entries
+            if isinstance(component, Forward) and str(component.id).strip()
+        ]
+        unresolved_replies: list[Reply] = []
+        for component, _, _ in local_entries:
+            if not isinstance(component, Reply) or not str(component.id).strip():
+                continue
+            embedded_media = any(
+                isinstance(nested, (Image, Video, Record, Forward))
+                for nested, _, _ in self._walk_components(component.chain or [])
+            )
+            if not embedded_media:
+                unresolved_replies.append(component)
+
+        if not forward_refs and not unresolved_replies:
+            return
+
+        client = OneBotClient(event)
+        remote_entries: list[tuple[Any, str | int | None, bool]] = []
+        for reply in unresolved_replies:
+            payload = await client.get_msg(reply.id)
+            if not payload:
+                continue
+            media, nested_ids = self._parse_forward_payload(payload, include_audio=True)
+            remote_entries.extend((component, reply.id, False) for component in media)
+            forward_refs.extend((forward_id, reply.id) for forward_id in nested_ids)
+
+        pending = list(dict.fromkeys(forward_refs))
+        seen_ids: set[tuple[str, str | int | None]] = set()
+        while pending and len(seen_ids) < MAX_FORWARD_FETCH:
+            forward_id, source_reply_id = pending.pop(0)
+            forward_key = (forward_id, source_reply_id)
+            if forward_key in seen_ids:
+                continue
+            seen_ids.add(forward_key)
+            payload = await client.get_forward_msg(forward_id)
+            if not payload:
+                continue
+            media, nested_ids = self._parse_forward_payload(
+                payload, include_audio=False
+            )
+            remote_entries.extend(
+                (component, source_reply_id, True) for component in media
+            )
+            pending.extend(
+                (item, source_reply_id)
+                for item in nested_ids
+                if (item, source_reply_id) not in seen_ids
+            )
+
+        deduplicated_entries = []
+        seen_entries: set[tuple[str, str, str, bool]] = set()
+        for component, reply_id, in_forward in remote_entries:
+            source = str(
+                getattr(component, "url", None)
+                or getattr(component, "file", None)
+                or getattr(component, "path", None)
+                or ""
+            )
+            key = (
+                component.__class__.__name__,
+                source,
+                str(reply_id or ""),
+                in_forward,
+            )
+            if key in seen_entries:
+                continue
+            seen_entries.add(key)
+            deduplicated_entries.append((component, reply_id, in_forward))
+        event.set_extra("mimo_media_remote_entries", deduplicated_entries)
 
     def _has_multimodal_message(self, event: AstrMessageEvent) -> bool:
         return any(
-            isinstance(component, (Image, Video, Record))
-            for component in self._message_components(event)
+            isinstance(component, (Image, Video))
+            or (isinstance(component, Record) and not in_forward)
+            for component, _, in_forward in self._component_entries(event)
         )
+
+    async def _merge_forward_images(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Add only top-level forwarded images not handled by AstrBot core."""
+        image_urls = list(req.image_urls or [])
+        seen = {str(item) for item in image_urls}
+        for component, reply_id, in_forward in self._component_entries(event):
+            if (
+                not isinstance(component, Image)
+                or not in_forward
+                or reply_id is not None
+            ):
+                continue
+            try:
+                image_path = await component.convert_to_file_path()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MiMoMedia] 合并转发图片解析失败: %s", exc)
+                continue
+            if image_path and str(image_path) not in seen:
+                image_urls.append(str(image_path))
+                seen.add(str(image_path))
+
+        req.image_urls = image_urls
 
     def _target_provider_available(self) -> bool:
         target_id = self._routing_provider_id()
@@ -283,9 +552,27 @@ class MiMoMediaPlugin(Star):
                 self._routing_remaining.clear()
                 return
 
+            await self._resolve_remote_media(event)
             key = self._session_key(event)
             remaining = self._routing_remaining.get(key, 0)
             has_multimodal = self._has_multimodal_message(event)
+            if not has_multimodal:
+                quoted_image_refs: list[str] = []
+                for component in getattr(event.message_obj, "message", []) or []:
+                    if not isinstance(component, Reply):
+                        continue
+                    try:
+                        quoted_image_refs.extend(
+                            await extract_quoted_message_images(event, component)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[MiMoMedia] 引用消息图片解析失败: %s", exc)
+                if quoted_image_refs:
+                    event.set_extra(
+                        "mimo_media_quoted_image_refs",
+                        list(dict.fromkeys(quoted_image_refs)),
+                    )
+                    has_multimodal = True
 
             # A new multimodal LLM request refreshes the routing window. Plain LLM
             # follow-ups consume the remaining requests without extending it.
@@ -373,8 +660,13 @@ class MiMoMediaPlugin(Star):
                     remaining,
                 )
             is_mimo_provider = self._is_mimo_provider(event)
-            if self._audio_mode() != LLONEBOT_STT_AUDIO_MODE and not is_mimo_provider:
+            audio_mode = self._audio_mode()
+            if audio_mode != LLONEBOT_STT_AUDIO_MODE and not is_mimo_provider:
                 return
+            if is_mimo_provider or audio_mode == LLONEBOT_STT_AUDIO_MODE:
+                await self._resolve_remote_media(event)
+            if is_mimo_provider:
+                await self._merge_forward_images(event, req)
             await self._handle(event, req, process_videos=is_mimo_provider)
         except Exception as exc:  # noqa: BLE001
             logger.error("[MiMoMedia] on_llm_request 处理失败: %s", exc, exc_info=True)
@@ -394,6 +686,12 @@ class MiMoMediaPlugin(Star):
         audio_refs: list[str] = []
         transcriptions: list[tuple[str, bool]] = []
         notes: list[str] = []
+        max_video_count = self._max_video_count()
+        if len(videos) > max_video_count:
+            notes.append(
+                f"[本次包含 {len(videos)} 个视频，仅处理前 {max_video_count} 个]"
+            )
+            videos = videos[:max_video_count]
 
         if audio_mode == LLONEBOT_STT_AUDIO_MODE:
             req.audio_urls = []
@@ -473,32 +771,25 @@ class MiMoMediaPlugin(Star):
         # 5. 清理插件创建的临时文件（下载源 + 转码产物）
         _cleanup_paths(cleanup_paths)
 
-    @staticmethod
-    def _collect_video_components(event: AstrMessageEvent) -> list[Video]:
-        videos: list[Video] = []
-        for comp in event.message_obj.message:
-            if isinstance(comp, Video):
-                videos.append(comp)
-            elif isinstance(comp, Reply) and comp.chain:
-                for reply_comp in comp.chain:
-                    if isinstance(reply_comp, Video):
-                        videos.append(reply_comp)
-        return videos
+    @classmethod
+    def _collect_video_components(cls, event: AstrMessageEvent) -> list[Video]:
+        return [
+            component
+            for component, _, _ in cls._component_entries(event)
+            if isinstance(component, Video)
+        ]
 
-    @staticmethod
-    def _collect_audio_components(event: AstrMessageEvent) -> list[Record]:
-        records: list[Record] = []
-        for comp in event.message_obj.message:
-            if isinstance(comp, Record):
-                records.append(comp)
-            elif isinstance(comp, Reply) and comp.chain:
-                for reply_comp in comp.chain:
-                    if isinstance(reply_comp, Record):
-                        records.append(reply_comp)
-        return records
+    @classmethod
+    def _collect_audio_components(cls, event: AstrMessageEvent) -> list[Record]:
+        return [
+            component
+            for component, _, in_forward in cls._component_entries(event)
+            if isinstance(component, Record) and not in_forward
+        ]
 
-    @staticmethod
+    @classmethod
     def _collect_audio_targets(
+        cls,
         event: AstrMessageEvent,
     ) -> list[tuple[Record, str | int | None, bool]]:
         raw_message = getattr(event.message_obj, "raw_message", None)
@@ -509,13 +800,11 @@ class MiMoMediaPlugin(Star):
             direct_message_id = getattr(event.message_obj, "message_id", None)
 
         targets: list[tuple[Record, str | int | None, bool]] = []
-        for comp in event.message_obj.message:
-            if isinstance(comp, Record):
-                targets.append((comp, direct_message_id, False))
-            elif isinstance(comp, Reply) and comp.chain:
-                for reply_comp in comp.chain:
-                    if isinstance(reply_comp, Record):
-                        targets.append((reply_comp, comp.id, True))
+        for component, reply_id, in_forward in cls._component_entries(event):
+            if not isinstance(component, Record) or in_forward:
+                continue
+            message_id = reply_id or direct_message_id
+            targets.append((component, message_id, reply_id is not None))
         return targets
 
     async def _transcribe_with_llonebot(

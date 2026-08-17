@@ -26,7 +26,15 @@ from astrbot.core.agent.message import (
     TextPart,
     dump_messages_with_checkpoints,
 )
-from astrbot.core.message.components import Image, Record, Reply, Video
+from astrbot.core.message.components import (
+    Forward,
+    Image,
+    Node,
+    Nodes,
+    Record,
+    Reply,
+    Video,
+)
 from astrbot.core.provider.entities import ProviderRequest
 from main import (
     MiMoMediaPlugin,
@@ -512,6 +520,28 @@ class _FakeContext:
         return self.providers["original"]
 
 
+class _FakeOneBotApi:
+    def __init__(self, forward_payloads):
+        self.forward_payloads = forward_payloads
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, params))
+        forward_id = str(params.get("message_id") or params.get("id") or "")
+        return self.forward_payloads.get(forward_id)
+
+
+class _FakeOneBot:
+    def __init__(self, forward_payloads, stt_text=""):
+        self.api = _FakeOneBotApi(forward_payloads)
+        self.stt_text = stt_text
+        self.stt_calls = []
+
+    async def call_action(self, **kwargs):
+        self.stt_calls.append(kwargs)
+        return {"data": {"text": self.stt_text}}
+
+
 @pytest.mark.parametrize(
     "component",
     [
@@ -524,6 +554,177 @@ class _FakeContext:
 def test_detects_multimodal_components_and_quoted_media(component):
     plugin = _plugin()
     assert plugin._has_multimodal_message(_FakeEvent([component]))
+
+
+def test_recursively_detects_media_inside_reply_and_forward_nodes():
+    plugin = _plugin()
+    record = Record(file="nested.wav")
+    event = _FakeEvent(
+        [
+            Reply(
+                id=456,
+                chain=[
+                    Nodes(
+                        [
+                            Node(
+                                content=[
+                                    Image(file="nested.jpg"),
+                                    Video(file="nested.mp4"),
+                                    record,
+                                ]
+                            )
+                        ]
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert plugin._has_multimodal_message(event)
+    assert [video.file for video in plugin._collect_video_components(event)] == [
+        "nested.mp4"
+    ]
+    assert plugin._collect_audio_components(event) == []
+    assert plugin._collect_audio_targets(event) == []
+
+
+@pytest.mark.asyncio
+async def test_forward_node_images_are_added_to_provider_request(monkeypatch):
+    async def fake_convert_to_file_path(image):
+        return f"resolved/{image.file}"
+
+    monkeypatch.setattr(Image, "convert_to_file_path", fake_convert_to_file_path)
+    plugin = _plugin()
+    event = _FakeEvent([Nodes([Node(content=[Image(file="nested.jpg")])])])
+    req = ProviderRequest(image_urls=[])
+
+    await plugin._merge_forward_images(event, req)
+
+    assert req.image_urls == ["resolved/nested.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_forward_id_resolves_remote_multimodal_components_for_routing():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+        },
+        context=context,
+    )
+    event = _FakeEvent([Forward(id="forward-1")])
+    event.bot = _FakeOneBot(
+        {
+            "forward-1": {
+                "data": {
+                    "messages": [
+                        {
+                            "content": [
+                                {"type": "image", "data": {"file": "a.jpg"}},
+                                {"type": "video", "data": {"file": "b.mp4"}},
+                                {"type": "record", "data": {"file": "c.amr"}},
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    await plugin.prepare_multimodal_routing(event)
+
+    assert event.get_extra("selected_provider") == "mimo"
+    assert [video.file for video in plugin._collect_video_components(event)] == [
+        "b.mp4"
+    ]
+    assert plugin._collect_audio_components(event) == []
+    assert event.bot.api.calls[0][0] == "get_forward_msg"
+
+
+@pytest.mark.asyncio
+async def test_reply_images_are_not_duplicated_by_plugin():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+        },
+        context=context,
+    )
+    event = _FakeEvent([Reply(id=789, chain=[])])
+    event.bot = _FakeOneBot(
+        {
+            "789": {
+                "data": {
+                    "message": [
+                        {"type": "image", "data": {"file": "reply.jpg"}},
+                        {"type": "video", "data": {"file": "reply.mp4"}},
+                        {"type": "record", "data": {"file": "reply.amr"}},
+                    ]
+                }
+            }
+        }
+    )
+    req = ProviderRequest(image_urls=["official/reply.jpg"])
+
+    await plugin.prepare_multimodal_routing(event)
+    await plugin._merge_forward_images(event, req)
+
+    assert event.get_extra("selected_provider") == "mimo"
+    assert req.image_urls == ["official/reply.jpg"]
+    audio_targets = plugin._collect_audio_targets(event)
+    assert len(audio_targets) == 1
+    assert audio_targets[0][1:] == ("789", True)
+    assert event.bot.api.calls[0][0] == "get_msg"
+
+
+@pytest.mark.asyncio
+async def test_video_count_limit_processes_only_configured_number(monkeypatch):
+    plugin = _plugin({"video_max_count": 2})
+    videos = [Video(file=f"video-{index}.mp4") for index in range(4)]
+    event = _FakeEvent(videos)
+    req = ProviderRequest(prompt="分析这些视频")
+    processed = []
+
+    async def fake_process_video(video):
+        processed.append(video.file)
+        return None, None, []
+
+    monkeypatch.setattr(plugin, "_process_video", fake_process_video)
+
+    await plugin._handle(event, req)
+
+    assert processed == ["video-0.mp4", "video-1.mp4"]
+    texts = [
+        part.text for part in req.extra_user_content_parts if hasattr(part, "text")
+    ]
+    assert texts == ["[本次包含 4 个视频，仅处理前 2 个]"]
+
+
+@pytest.mark.asyncio
+async def test_llonebot_stt_resolves_reply_id_audio_with_non_mimo_provider():
+    context = _FakeContext()
+    plugin = _plugin({"audio_mode": "llonebot_stt"}, context=context)
+    event = _FakeEvent([Reply(id=321, chain=[])])
+    event.bot = _FakeOneBot(
+        {
+            "321": {
+                "data": {"message": [{"type": "record", "data": {"file": "reply.amr"}}]}
+            }
+        },
+        stt_text="远程引用语音转写成功",
+    )
+    req = ProviderRequest(
+        extra_user_content_parts=[
+            TextPart(text=("<Quoted Message>\n(user): [Empty Text]\n</Quoted Message>"))
+        ]
+    )
+
+    await plugin.on_llm_request(event, req)
+
+    assert event.bot.stt_calls == [{"action": "voice_msg_to_text", "message_id": 321}]
+    assert "远程引用语音转写成功" in req.extra_user_content_parts[0].text
 
 
 @pytest.mark.asyncio
