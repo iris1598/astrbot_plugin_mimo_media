@@ -4,11 +4,12 @@
     python -m pytest astrbot_plugin_mimo_media/tests -v
 """
 
-import asyncio
-import base64
 import subprocess
 import sys
 from pathlib import Path
+
+# The plugin and AstrBot source directories are added to sys.path below.
+# ruff: noqa: E402
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 REPO_DIR = PLUGIN_DIR.parent
@@ -25,7 +26,7 @@ from astrbot.core.agent.message import (
     TextPart,
     dump_messages_with_checkpoints,
 )
-from astrbot.core.message.components import Record, Reply, Video
+from astrbot.core.message.components import Image, Record, Reply, Video
 from astrbot.core.provider.entities import ProviderRequest
 from main import (
     MiMoMediaPlugin,
@@ -220,7 +221,7 @@ def test_validate_wav_rejects_garbage():
 
 def test_base64_size_mb():
     payload = _bytes_to_data_url(b"x" * 1024 * 1024, "video/mp4")
-    assert abs(_base64_size_mb(payload) - (4.0/3.0)) < 0.05
+    assert abs(_base64_size_mb(payload) - (4.0 / 3.0)) < 0.05
 
 
 # ---- ContentPart 序列化 ----
@@ -292,9 +293,7 @@ async def test_assemble_context_injection_roundtrip():
 
     # 历史持久化时，临时媒体块不应写入
     dumped = dump_messages_with_checkpoints([msg])
-    saved_types = [
-        b.get("type") for b in dumped[0]["content"] if isinstance(b, dict)
-    ]
+    saved_types = [b.get("type") for b in dumped[0]["content"] if isinstance(b, dict)]
     assert "video_url" not in saved_types
     assert "input_audio" not in saved_types
 
@@ -333,9 +332,7 @@ def test_replace_empty_text_for_quoted_audio():
     MiMoMediaPlugin._replace_empty_text_for_quoted_audio(req)
 
     assert req.extra_user_content_parts[0].text == (
-        "<Quoted Message>\n"
-        "(Iris-カラーアイリス): [Audio]\n"
-        "</Quoted Message>"
+        "<Quoted Message>\n(Iris-カラーアイリス): [Audio]\n</Quoted Message>"
     )
     assert req.extra_user_content_parts[1].text == "[Empty Text]"
 
@@ -383,21 +380,23 @@ async def test_llonebot_mode_replaces_quoted_empty_text():
 
     await plugin._handle(event, req)
 
-    assert event.bot.calls == [
-        {"action": "voice_msg_to_text", "message_id": 456}
+    assert event.bot.calls == [{"action": "voice_msg_to_text", "message_id": 456}]
+    texts = [
+        part.text for part in req.extra_user_content_parts if hasattr(part, "text")
     ]
-    texts = [part.text for part in req.extra_user_content_parts if hasattr(part, "text")]
     assert "这是语音转写" not in texts
     assert any("(Iris-カラーアイリス): 这是语音转写" in text for text in texts)
     assert all("Audio Attachment" not in text for text in texts)
-    assert not any(isinstance(part, InputAudioPart) for part in req.extra_user_content_parts)
+    assert not any(
+        isinstance(part, InputAudioPart) for part in req.extra_user_content_parts
+    )
 
 
 # ---- 插件实例级处理（音频超限/失败提示） ----
 
 
-def _plugin(config: dict | None = None) -> MiMoMediaPlugin:
-    return MiMoMediaPlugin(context=None, config=config or {})
+def _plugin(config: dict | None = None, context=None) -> MiMoMediaPlugin:
+    return MiMoMediaPlugin(context=context, config=config or {})
 
 
 @pytest.mark.asyncio
@@ -449,14 +448,146 @@ async def test_process_video_oversize_two_pass_then_note(sample_video: Path):
     main._cleanup_paths(paths)
     for p in paths:
         assert not Path(p).exists()
-# ---- _handle ???? ----
+
+
+# ---- Routing and _handle ----
 
 
 class _FakeEvent:
-    def __init__(self, chain, audio_urls):
-        self.unified_msg_origin = "test:user@test"
-        self.message_obj = type("Obj", (), {"message": chain})()
-        self.audio_urls = audio_urls
+    def __init__(self, chain, audio_urls=None, umo="test:user@test"):
+        self.unified_msg_origin = umo
+        self.message_obj = type(
+            "Obj",
+            (),
+            {"message": chain, "session_id": umo, "raw_message": None},
+        )()
+        self.audio_urls = audio_urls or []
+        self._extras = {}
+
+    def get_extra(self, key):
+        return self._extras.get(key)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+
+class _FakeProvider:
+    def __init__(self, model="text-model", provider_type="openai_chat_completion"):
+        self.model = model
+        self.provider_config = {"type": provider_type, "api_base": ""}
+
+    def get_model(self):
+        return self.model
+
+
+class _FakeContext:
+    def __init__(self):
+        self.providers = {
+            "original": _FakeProvider(),
+            "mimo": _FakeProvider(
+                model="mimo-v2.5",
+                provider_type="xiaomi_chat_completion",
+            ),
+        }
+
+    def get_provider_by_id(self, provider_id):
+        return self.providers.get(provider_id)
+
+    def get_using_provider(self, umo=None):
+        return self.providers["original"]
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        Image(file="image.jpg"),
+        Video(file="video.mp4"),
+        Record(file="audio.wav"),
+        Reply(id=1, chain=[Image(file="quoted.jpg")]),
+    ],
+)
+def test_detects_multimodal_components_and_quoted_media(component):
+    plugin = _plugin()
+    assert plugin._has_multimodal_message(_FakeEvent([component]))
+
+
+@pytest.mark.asyncio
+async def test_routing_disabled_preserves_original_logic():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": False,
+            "multimodal_provider_id": "mimo",
+        },
+        context=context,
+    )
+    event = _FakeEvent([Image(file="image.jpg")])
+
+    await plugin.prepare_multimodal_routing(event)
+
+    assert event.get_extra("selected_provider") is None
+    assert plugin._routing_remaining == {}
+
+
+@pytest.mark.asyncio
+async def test_default_routing_only_selects_mimo_for_trigger_turn():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+        },
+        context=context,
+    )
+    media_event = _FakeEvent([Image(file="image.jpg")])
+    follow_up = _FakeEvent([])
+
+    await plugin.prepare_multimodal_routing(media_event)
+    await plugin.prepare_multimodal_routing(follow_up)
+
+    assert media_event.get_extra("selected_provider") == "mimo"
+    assert media_event.get_extra("mimo_media_routed") is True
+    assert follow_up.get_extra("selected_provider") is None
+    assert plugin._routing_remaining == {}
+
+
+@pytest.mark.asyncio
+async def test_configured_routing_turns_then_returns_to_original_provider():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+            "multimodal_route_turns": 3,
+        },
+        context=context,
+    )
+    events = [
+        _FakeEvent([Video(file="video.mp4")]),
+        _FakeEvent([]),
+        _FakeEvent([]),
+        _FakeEvent([]),
+    ]
+
+    for event in events:
+        await plugin.prepare_multimodal_routing(event)
+
+    assert [event.get_extra("selected_provider") for event in events] == [
+        "mimo",
+        "mimo",
+        "mimo",
+        None,
+    ]
+    assert plugin._routing_remaining == {}
+
+
+def test_selected_routing_provider_is_used_for_mimo_detection():
+    context = _FakeContext()
+    plugin = _plugin(context=context)
+    event = _FakeEvent([Record(file="audio.wav")])
+    event.set_extra("selected_provider", "mimo")
+
+    assert plugin._is_mimo_provider(event)
 
 
 @pytest.mark.asyncio
@@ -478,17 +609,26 @@ async def test_handle_injects_video_and_audio(sample_video: Path, sample_wav: Pa
     # ?? URL ???????? Mimo ???????
     assert req.audio_urls == []
     # 占位符被移除
-    assert all("[Attachment" not in getattr(p, "text", "") for p in req.extra_user_content_parts)
+    assert all(
+        "[Attachment" not in getattr(p, "text", "")
+        for p in req.extra_user_content_parts
+    )
     # 注入的媒体块存在
     types = [p.type for p in req.extra_user_content_parts]
     assert "video_url" in types
     assert "input_audio" in types
     video_part = next(p for p in req.extra_user_content_parts if p.type == "video_url")
-    audio_part = next(p for p in req.extra_user_content_parts if p.type == "input_audio")
+    audio_part = next(
+        p for p in req.extra_user_content_parts if p.type == "input_audio"
+    )
     assert video_part.video_url.url.startswith("data:video/mp4;base64,")
     assert audio_part.input_audio.data.startswith("data:audio/wav;base64,")
     # 默认 mark_as_temp，不入库
-    assert all(getattr(p, "_no_save", False) for p in req.extra_user_content_parts if p.type in ("video_url", "input_audio"))
+    assert all(
+        getattr(p, "_no_save", False)
+        for p in req.extra_user_content_parts
+        if p.type in ("video_url", "input_audio")
+    )
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,8 @@
 - 用户在对话中发送**音频/语音**：插件自动转换为标准 **WAV** → Base64 上传（`input_audio` 内容块，`data:` 前缀格式，同 MiMo 官方文档）。
 - 音频可选择发送给 MiMo 多模态模型，或调用 llonebot 的 `voice_msg_to_text` 接口转成文字。
 - 与 AstrBot 图片处理走**同一对话流水线**（`on_llm_request` 钩子），保留人设、会话历史与多轮上下文。
-- 非 MiMo 提供商（或未开启插件）时完全无操作。
+- 可选开启多模态路由：包含图片、视频或音频的消息会临时切换到指定 MiMo provider，并在配置轮数耗尽后自动恢复原模型。
+- 非 MiMo 提供商（或未开启插件、未开启路由）时保留原有逻辑。
 
 ## 安装
 1. 将本目录复制到 AstrBot 的 `data/plugins/astrbot_plugin_mimo_media`。
@@ -22,6 +23,9 @@
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enable` | `true` | 是否启用本插件 |
+| `multimodal_routing_enabled` | `false` | 是否开启图片、视频、音频消息的临时 MiMo 路由 |
+| `multimodal_provider_id` | `""` | 路由目标 MiMo provider（WebUI 可直接选择） |
+| `multimodal_route_turns` | `1` | 路由持续轮数，耗尽后自动恢复原模型 |
 | `audio_mode` | `multimodal` | 音频模式：`multimodal` 发送给 MiMo；`llonebot_stt` 调用 llonebot 转文字后发送文字，不发送音频 |
 | `video_fps` | `2.0` | 视频每秒抽帧数，范围 [0.1, 10] |
 | `video_resolution` | `default` | 视频单帧分辨率档次：`default` / `max` |

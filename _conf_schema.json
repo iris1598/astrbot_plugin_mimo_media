@@ -5,6 +5,25 @@
     "default": true,
     "hint": "关闭后插件对所有请求无操作。"
   },
+  "multimodal_routing_enabled": {
+    "description": "启用多模态消息临时路由",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，包含图片、视频或音频的消息会临时路由到下方配置的 MiMo provider；关闭时保留原有逻辑。"
+  },
+  "multimodal_provider_id": {
+    "description": "多模态路由目标 MiMo provider",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "选择已配置的 MiMo provider。路由只对当前会话临时生效，不会修改 AstrBot 的全局模型。"
+  },
+  "multimodal_route_turns": {
+    "description": "多模态路由持续轮数",
+    "type": "int",
+    "default": 1,
+    "hint": "默认只使用 MiMo 处理触发多模态路由的这一轮；设置更大值时，后续对话轮数也会继续使用 MiMo，耗尽后自动恢复原模型。"
+  },
   "audio_mode": {
     "description": "音频处理模式",
     "type": "string",

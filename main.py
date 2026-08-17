@@ -8,7 +8,7 @@
 - 音频：取得原始音频后通过系统 FFmpeg 强制转换为标准 WAV，Base64 后以
   {"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,..."}}
   注入（MiMo 要求 data 携带 data: 前缀、不含 format 字段）。
-- 非 MiMo 提供商时插件完全无操作。
+- 路由关闭时，非 MiMo 提供商完全无操作；路由开启后，多模态消息会临时选择配置的 MiMo 提供商。
 """
 
 import asyncio
@@ -25,7 +25,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import ContentPart, TextPart
-from astrbot.core.message.components import Record, Reply, Video
+from astrbot.core.message.components import Image, Record, Reply, Video
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from astrbot.core.utils.datetime_utils import generate_timestamp_id
 from astrbot.core.utils.media_utils import MediaResolver
@@ -202,6 +202,8 @@ class MiMoMediaPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
         self.config = config if isinstance(config, dict) else {}
+        # Remaining requests in the temporary MiMo routing window, keyed by UMO.
+        self._routing_remaining: dict[str, int] = {}
 
     def _cfg(self, key: str, default: Any) -> Any:
         return self.config.get(key, default)
@@ -209,24 +211,123 @@ class MiMoMediaPlugin(Star):
     def _enabled(self) -> bool:
         return bool(self._cfg("enable", True))
 
+    def _routing_enabled(self) -> bool:
+        return bool(self._cfg("multimodal_routing_enabled", False))
+
+    def _routing_provider_id(self) -> str:
+        return str(self._cfg("multimodal_provider_id", "") or "").strip()
+
+    def _routing_turns(self) -> int:
+        raw_value = self._cfg("multimodal_route_turns", 1)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[MiMoMedia] 无效的 multimodal_route_turns=%r，使用默认值 1",
+                raw_value,
+            )
+            return 1
+        return max(1, value)
+
+    @staticmethod
+    def _session_key(event: AstrMessageEvent) -> str:
+        return str(
+            getattr(event, "unified_msg_origin", None)
+            or getattr(getattr(event, "message_obj", None), "session_id", None)
+            or getattr(event, "session_id", None)
+            or "default"
+        )
+
+    @staticmethod
+    def _message_components(event: AstrMessageEvent) -> list[Any]:
+        components: list[Any] = []
+        message_obj = getattr(event, "message_obj", None)
+        for component in getattr(message_obj, "message", []) or []:
+            components.append(component)
+            if isinstance(component, Reply) and component.chain:
+                components.extend(component.chain)
+        return components
+
+    def _has_multimodal_message(self, event: AstrMessageEvent) -> bool:
+        return any(
+            isinstance(component, (Image, Video, Record))
+            for component in self._message_components(event)
+        )
+
+    def _target_provider_available(self) -> bool:
+        target_id = self._routing_provider_id()
+        if not target_id:
+            logger.warning("[MiMoMedia] 未配置多模态路由目标 MiMo provider")
+            return False
+        provider = self.context.get_provider_by_id(target_id)
+        if provider is None:
+            logger.error(
+                "[MiMoMedia] 多模态路由目标 provider %r 不存在，请检查插件配置",
+                target_id,
+            )
+            return False
+        if not self._provider_is_mimo(provider):
+            logger.error(
+                "[MiMoMedia] 多模态路由目标 provider %r 不是 MiMo provider",
+                target_id,
+            )
+            return False
+        return True
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def prepare_multimodal_routing(self, event: AstrMessageEvent):
+        """Temporarily select the configured MiMo provider for multimodal turns."""
+        try:
+            if not self._enabled() or not self._routing_enabled():
+                self._routing_remaining.clear()
+                return
+
+            key = self._session_key(event)
+            remaining = self._routing_remaining.get(key, 0)
+            has_multimodal = self._has_multimodal_message(event)
+
+            # Each multimodal message refreshes the routing window. Plain follow-up
+            # messages consume the remaining requests without extending it.
+            if has_multimodal:
+                remaining = self._routing_turns()
+
+            if remaining <= 0:
+                self._routing_remaining.pop(key, None)
+                return
+            if not self._target_provider_available():
+                self._routing_remaining.pop(key, None)
+                return
+
+            event.set_extra("selected_provider", self._routing_provider_id())
+            event.set_extra("mimo_media_routed", True)
+            remaining -= 1
+            if remaining:
+                self._routing_remaining[key] = remaining
+            else:
+                self._routing_remaining.pop(key, None)
+            logger.info(
+                "[MiMoMedia] 多模态路由至 %s，本次后剩余 %d 轮",
+                self._routing_provider_id(),
+                remaining,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[MiMoMedia] 多模态路由选择失败: %s", exc, exc_info=True)
+
     def _audio_mode(self) -> str:
         mode = str(self._cfg("audio_mode", DEFAULT_AUDIO_MODE) or "").strip().lower()
         if mode not in (DEFAULT_AUDIO_MODE, LLONEBOT_STT_AUDIO_MODE):
             return DEFAULT_AUDIO_MODE
         return mode
 
-    def _is_mimo_provider(self, event: AstrMessageEvent) -> bool:
-        """判定当前会话激活的对话提供商是否为小米 MiMo。"""
-        try:
-            prov = self.context.get_using_provider(umo=event.unified_msg_origin)
-        except Exception:
-            return False
-        if prov is None:
+    @staticmethod
+    def _provider_is_mimo(provider: Any) -> bool:
+        """Return whether a provider is a Xiaomi MiMo chat provider."""
+        if provider is None:
             return False
         try:
-            model = str(prov.get_model() or "").lower()
-            api_base = str(prov.provider_config.get("api_base", "") or "").lower()
-            provider_type = str(prov.provider_config.get("type", "") or "").lower()
+            model = str(provider.get_model() or "").lower()
+            api_base = str(provider.provider_config.get("api_base", "") or "").lower()
+            provider_type = str(provider.provider_config.get("type", "") or "").lower()
         except Exception:
             return False
         return (
@@ -234,6 +335,22 @@ class MiMoMediaPlugin(Star):
             or "xiaomimimo" in api_base
             or provider_type in ("xiaomi_chat_completion", "xiaomi_token_plan")
         )
+
+    def _is_mimo_provider(self, event: AstrMessageEvent) -> bool:
+        """判定本次请求实际选择的对话提供商是否为小米 MiMo。"""
+        selected_provider = None
+        try:
+            selected_provider = event.get_extra("selected_provider")
+        except Exception:
+            pass
+        if selected_provider:
+            provider = self.context.get_provider_by_id(str(selected_provider))
+            return self._provider_is_mimo(provider)
+        try:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception:
+            return False
+        return self._provider_is_mimo(provider)
 
     @filter.on_llm_request(priority=10)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -289,10 +406,7 @@ class MiMoMediaPlugin(Star):
         cleanup_paths: list[str] = []
         # 原始 Record 优先时，清理由 AstrBot 预先生成但插件不会再使用的音频文件。
         for request_audio_ref in request_audio_refs:
-            if (
-                _is_temp_path(request_audio_ref)
-                and request_audio_ref not in audio_refs
-            ):
+            if _is_temp_path(request_audio_ref) and request_audio_ref not in audio_refs:
                 cleanup_paths.append(request_audio_ref)
 
         # 1. 视频：下载 -> 强制重编码 H264 -> Base64 Data URL
@@ -398,7 +512,9 @@ class MiMoMediaPlugin(Star):
         seen_message_ids: set[str] = set()
         for _, message_id, is_reply in audio_targets:
             if message_id is None or not str(message_id).strip():
-                logger.warning("[MiMoMedia] 语音消息缺少 message_id，无法调用 llonebot 转写")
+                logger.warning(
+                    "[MiMoMedia] 语音消息缺少 message_id，无法调用 llonebot 转写"
+                )
                 continue
             message_id_key = str(message_id)
             if message_id_key in seen_message_ids:
@@ -413,11 +529,7 @@ class MiMoMediaPlugin(Star):
                     action="voice_msg_to_text",
                     message_id=api_message_id,
                 )
-                data = (
-                    result.get("data", result)
-                    if isinstance(result, dict)
-                    else {}
-                )
+                data = result.get("data", result) if isinstance(result, dict) else {}
                 text = data.get("text") if isinstance(data, dict) else None
                 if isinstance(text, str) and text.strip():
                     transcriptions.append((text.strip(), is_reply))
@@ -572,3 +684,4 @@ class MiMoMediaPlugin(Star):
 
     async def terminate(self):
         """插件卸载/停用时调用。"""
+        self._routing_remaining.clear()
