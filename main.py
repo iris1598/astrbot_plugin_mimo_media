@@ -32,7 +32,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import Provider, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core import astrbot_config, file_token_service
-from astrbot.core.agent.message import ContentPart, TextPart
+from astrbot.core.agent.message import ContentPart, Message, TextPart
 from astrbot.core.message.components import (
     Forward,
     Image,
@@ -1007,9 +1007,13 @@ class MiMoMediaPlugin(Star):
             req.extra_user_content_parts.append(TextPart(text="[视频/音频转述失败]"))
             return
         try:
+            # Reuse the direct-mode assembly path so custom MiMo content parts are
+            # converted to raw context dictionaries before provider validation.
+            caption_context = Message.model_validate(
+                await caption_req.assemble_context()
+            )
             response = await provider.text_chat(
-                prompt=caption_req.prompt,
-                extra_user_content_parts=media_parts,
+                contexts=[caption_context],
             )
             caption = str(response.completion_text or "").strip()
             if caption:

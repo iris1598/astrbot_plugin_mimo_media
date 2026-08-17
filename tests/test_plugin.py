@@ -851,7 +851,14 @@ async def test_caption_mode_injects_media_caption_without_routing_images(monkeyp
     await plugin._caption_media(event, req, process_audio=True)
 
     assert req.image_urls == ["official.jpg"]
-    assert context.providers["mimo"].chat_calls[0]["prompt"] == "转述这些媒体"
+    caption_call = context.providers["mimo"].chat_calls[0]
+    assert "extra_user_content_parts" not in caption_call
+    caption_context = caption_call["contexts"][0]
+    assert isinstance(caption_context, Message)
+    assert caption_context.role == "user"
+    assert [part.type for part in caption_context.content] == ["text", "video_url"]
+    assert caption_context.content[0].text == "转述这些媒体"
+    assert "_no_save" not in caption_context.model_dump()["content"][1]
     assert all(
         not isinstance(part, VideoURLPart) for part in req.extra_user_content_parts
     )
