@@ -545,7 +545,30 @@ async def test_routing_disabled_preserves_original_logic():
 
 
 @pytest.mark.asyncio
-async def test_default_routing_only_selects_mimo_for_trigger_turn():
+async def test_cancelled_multimodal_llm_does_not_start_routing_window():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+            "multimodal_route_turns": 3,
+        },
+        context=context,
+    )
+    cancelled_event = _FakeEvent([Image(file="image.jpg")])
+    next_llm_event = _FakeEvent([])
+
+    await plugin.prepare_multimodal_routing(cancelled_event)
+    # Simulate cancellation before on_llm_request is emitted.
+    await plugin.prepare_multimodal_routing(next_llm_event)
+
+    assert cancelled_event.get_extra("selected_provider") == "mimo"
+    assert next_llm_event.get_extra("selected_provider") is None
+    assert plugin._routing_remaining == {}
+
+
+@pytest.mark.asyncio
+async def test_default_routing_only_selects_mimo_for_triggered_llm():
     context = _FakeContext()
     plugin = _plugin(
         {
@@ -558,6 +581,7 @@ async def test_default_routing_only_selects_mimo_for_trigger_turn():
     follow_up = _FakeEvent([])
 
     await plugin.prepare_multimodal_routing(media_event)
+    await plugin.on_llm_request(media_event, ProviderRequest(prompt="test"))
     await plugin.prepare_multimodal_routing(follow_up)
 
     assert media_event.get_extra("selected_provider") == "mimo"
@@ -578,14 +602,16 @@ async def test_configured_routing_turns_then_returns_to_original_provider():
         context=context,
     )
     events = [
-        _FakeEvent([Video(file="video.mp4")]),
+        _FakeEvent([Image(file="image.jpg")]),
         _FakeEvent([]),
         _FakeEvent([]),
         _FakeEvent([]),
     ]
 
-    for event in events:
+    for event in events[:3]:
         await plugin.prepare_multimodal_routing(event)
+        await plugin.on_llm_request(event, ProviderRequest(prompt="test"))
+    await plugin.prepare_multimodal_routing(events[3])
 
     assert [event.get_extra("selected_provider") for event in events] == [
         "mimo",
@@ -593,6 +619,40 @@ async def test_configured_routing_turns_then_returns_to_original_provider():
         "mimo",
         None,
     ]
+    assert plugin._routing_remaining == {}
+
+
+@pytest.mark.asyncio
+async def test_message_without_llm_does_not_consume_active_routing_window():
+    context = _FakeContext()
+    plugin = _plugin(
+        {
+            "multimodal_routing_enabled": True,
+            "multimodal_provider_id": "mimo",
+            "multimodal_route_turns": 2,
+        },
+        context=context,
+    )
+    media_event = _FakeEvent([Image(file="image.jpg")])
+    intercepted_event = _FakeEvent([])
+    llm_event = _FakeEvent([])
+    restored_event = _FakeEvent([])
+
+    await plugin.prepare_multimodal_routing(media_event)
+    await plugin.on_llm_request(media_event, ProviderRequest(prompt="test"))
+    assert plugin._routing_remaining == {"test:user@test": 1}
+
+    # A later waiting hook may still cancel the request before on_llm_request.
+    await plugin.prepare_multimodal_routing(intercepted_event)
+    assert intercepted_event.get_extra("selected_provider") == "mimo"
+    assert plugin._routing_remaining == {"test:user@test": 1}
+
+    await plugin.prepare_multimodal_routing(llm_event)
+    await plugin.on_llm_request(llm_event, ProviderRequest(prompt="test"))
+    await plugin.prepare_multimodal_routing(restored_event)
+
+    assert llm_event.get_extra("selected_provider") == "mimo"
+    assert restored_event.get_extra("selected_provider") is None
     assert plugin._routing_remaining == {}
 
 

@@ -275,9 +275,9 @@ class MiMoMediaPlugin(Star):
             return False
         return True
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    @filter.on_waiting_llm_request(priority=100)
     async def prepare_multimodal_routing(self, event: AstrMessageEvent):
-        """Temporarily select the configured MiMo provider for multimodal turns."""
+        """Select MiMo only after AstrBot confirms this message will call an LLM."""
         try:
             if not self._enabled() or not self._routing_enabled():
                 self._routing_remaining.clear()
@@ -287,8 +287,8 @@ class MiMoMediaPlugin(Star):
             remaining = self._routing_remaining.get(key, 0)
             has_multimodal = self._has_multimodal_message(event)
 
-            # Each multimodal message refreshes the routing window. Plain follow-up
-            # messages consume the remaining requests without extending it.
+            # A new multimodal LLM request refreshes the routing window. Plain LLM
+            # follow-ups consume the remaining requests without extending it.
             if has_multimodal:
                 remaining = self._routing_turns()
 
@@ -301,15 +301,10 @@ class MiMoMediaPlugin(Star):
 
             event.set_extra("selected_provider", self._routing_provider_id())
             event.set_extra("mimo_media_routed", True)
-            remaining -= 1
-            if remaining:
-                self._routing_remaining[key] = remaining
-            else:
-                self._routing_remaining.pop(key, None)
+            event.set_extra("mimo_media_route_new_window", has_multimodal)
             logger.info(
-                "[MiMoMedia] 多模态路由至 %s，本次后剩余 %d 轮",
+                "[MiMoMedia] 已为待执行的 LLM 请求选择 %s",
                 self._routing_provider_id(),
-                remaining,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("[MiMoMedia] 多模态路由选择失败: %s", exc, exc_info=True)
@@ -359,6 +354,24 @@ class MiMoMediaPlugin(Star):
         try:
             if not self._enabled():
                 return
+            if event.get_extra("mimo_media_routed") and not event.get_extra(
+                "mimo_media_route_consumed"
+            ):
+                key = self._session_key(event)
+                if event.get_extra("mimo_media_route_new_window"):
+                    remaining = self._routing_turns()
+                else:
+                    remaining = self._routing_remaining.get(key, 0)
+                remaining = max(0, remaining - 1)
+                if remaining:
+                    self._routing_remaining[key] = remaining
+                else:
+                    self._routing_remaining.pop(key, None)
+                event.set_extra("mimo_media_route_consumed", True)
+                logger.info(
+                    "[MiMoMedia] LLM 请求实际触发，本次后剩余 %d 轮 MiMo 路由",
+                    remaining,
+                )
             is_mimo_provider = self._is_mimo_provider(event)
             if self._audio_mode() != LLONEBOT_STT_AUDIO_MODE and not is_mimo_provider:
                 return

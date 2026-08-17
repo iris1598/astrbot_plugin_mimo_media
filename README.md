@@ -8,6 +8,7 @@
 - 音频可选择发送给 MiMo 多模态模型，或调用 llonebot 的 `voice_msg_to_text` 接口转成文字；`llonebot_stt` 不受当前模型和多模态路由配置影响。
 - 与 AstrBot 图片处理走**同一对话流水线**（`on_llm_request` 钩子），保留人设、会话历史与多轮上下文。
 - 可选开启多模态路由：包含图片、视频或音频的消息会临时切换到指定 MiMo provider，并在配置轮数耗尽后自动恢复原模型。
+- `on_waiting_llm_request` 只为已确定调用 LLM 的消息选择候选 MiMo provider，直到 `on_llm_request` 实际触发才开启或消耗路由轮数；被指令拦截或在等待阶段取消的消息不计数。
 - 非 MiMo 提供商（或未开启插件、未开启路由）时保留原有逻辑。
 
 ## 安装
