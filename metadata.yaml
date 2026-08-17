@@ -2,6 +2,6 @@ name: astrbot_plugin_mimo_media # 插件唯一识别名
 display_name: MiMo 视频/音频多模态 # 展示名
 desc: 为 AstrBot 中的小米 MiMo（mimo-v2.5 系列）补全视频与音频理解能力，并可将图片、视频、音频消息临时路由到指定 MiMo provider。
 short_desc: 让 MiMo 看懂视频、听懂音频，并按需临时路由多模态消息。
-version: v1.2.1
+version: v1.3.0
 author: Iris1598
 repo: https://github.com/iris1598/astrbot_plugin_mimo_media

@@ -38,6 +38,12 @@
     "options": ["base64", "astrbot_file_service"],
     "hint": "base64：将转码后的视频直接放入模型请求；astrbot_file_service：使用 callback_api_base 生成临时公网链接供 MiMo 下载，文件服务不可用时跳过视频。"
   },
+  "video_always_compress": {
+    "description": "视频总是压缩",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，无论使用 Base64 还是 AstrBot 文件服务，视频都会按 max_video_width 缩放并使用 CRF 28 压缩。关闭时仅在 Base64 超限后压缩。"
+  },
   "video_fps": {
     "description": "视频抽帧帧率 fps",
     "type": "float",

@@ -1039,7 +1039,12 @@ class MiMoMediaPlugin(Star):
             if _is_temp_path(src):
                 cleanup_paths.append(src)
 
-            out = await _to_h264_mp4(src)
+            always_compress = bool(self._cfg("video_always_compress", False))
+            max_width = int(self._cfg("max_video_width", DEFAULT_MAX_VIDEO_WIDTH))
+            if always_compress:
+                out = await _to_h264_mp4(src, max_width=max_width, crf=28)
+            else:
+                out = await _to_h264_mp4(src)
             cleanup_paths.append(str(out))
 
             if self._video_transport() == ASTRBOT_FILE_SERVICE_TRANSPORT:
@@ -1080,9 +1085,8 @@ class MiMoMediaPlugin(Star):
 
             max_mb = float(self._cfg("video_max_base64_mb", DEFAULT_MAX_BASE64_MB))
             data_url = _bytes_to_data_url(out.read_bytes(), VIDEO_MIME)
-            if _base64_size_mb(data_url) > max_mb:
+            if _base64_size_mb(data_url) > max_mb and not always_compress:
                 # 超限：压缩一次（缩放到 max_video_width + CRF 28）
-                max_width = int(self._cfg("max_video_width", DEFAULT_MAX_VIDEO_WIDTH))
                 out2 = await _to_h264_mp4(src, max_width=max_width, crf=28)
                 cleanup_paths.append(str(out2))
                 data_url = _bytes_to_data_url(out2.read_bytes(), VIDEO_MIME)

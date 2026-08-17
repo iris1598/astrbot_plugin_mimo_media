@@ -461,6 +461,20 @@ async def test_process_video_success(sample_video: Path):
 
 
 @pytest.mark.asyncio
+async def test_process_video_always_compresses(sample_video: Path):
+    plugin = _plugin({"video_always_compress": True, "max_video_width": 160})
+    video = Video.fromFileSystem(path=str(sample_video))
+
+    part, note, paths = await plugin._process_video(video)
+    try:
+        assert part is not None
+        assert note is None
+        assert _ffprobe_entry(Path(paths[-1]), "v:0", "width") == "160"
+    finally:
+        main._cleanup_paths(paths)
+
+
+@pytest.mark.asyncio
 async def test_process_video_uses_astrbot_file_service(sample_video: Path, monkeypatch):
     class FakeFileTokenService:
         async def handle_file(self, token):
