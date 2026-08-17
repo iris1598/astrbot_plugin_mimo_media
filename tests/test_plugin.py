@@ -315,6 +315,21 @@ def test_drop_placeholders():
     assert req.extra_user_content_parts[0].text == "hello"
 
 
+def test_drop_audio_placeholder_keeps_video_for_non_mimo_provider():
+    req = ProviderRequest(
+        extra_user_content_parts=[
+            TextPart(text="[Video Attachment: name v.mp4, path C:/tmp/v.mp4]"),
+            TextPart(text="[Audio Attachment: path C:/tmp/a.wav]"),
+        ],
+    )
+
+    MiMoMediaPlugin._drop_placeholders(req, drop_video=False)
+
+    assert [part.text for part in req.extra_user_content_parts] == [
+        "[Video Attachment: name v.mp4, path C:/tmp/v.mp4]"
+    ]
+
+
 def test_replace_empty_text_for_quoted_audio():
     req = ProviderRequest(
         extra_user_content_parts=[
@@ -588,6 +603,39 @@ def test_selected_routing_provider_is_used_for_mimo_detection():
     event.set_extra("selected_provider", "mimo")
 
     assert plugin._is_mimo_provider(event)
+
+
+@pytest.mark.asyncio
+async def test_llonebot_stt_runs_with_non_mimo_provider_and_keeps_video_hint():
+    context = _FakeContext()
+    plugin = _plugin({"audio_mode": "llonebot_stt"}, context=context)
+    event = _FakeEvent(
+        [
+            Video(file="video.mp4"),
+            Record(file="voice.amr"),
+        ]
+    )
+    event.bot = _FakeBot("任意模型都能收到这段转写")
+    event.message_obj.raw_message = {"message_id": 123}
+    req = ProviderRequest(
+        extra_user_content_parts=[
+            TextPart(text="[Video Attachment: name v.mp4, path video.mp4]"),
+            TextPart(text="[Audio Attachment: path voice.amr]"),
+        ]
+    )
+
+    await plugin.on_llm_request(event, req)
+
+    assert event.bot.calls == [{"action": "voice_msg_to_text", "message_id": 123}]
+    texts = [
+        part.text for part in req.extra_user_content_parts if hasattr(part, "text")
+    ]
+    assert "任意模型都能收到这段转写" in texts
+    assert any(text.startswith("[Video Attachment:") for text in texts)
+    assert all(not text.startswith("[Audio Attachment:") for text in texts)
+    assert all(
+        not isinstance(part, VideoURLPart) for part in req.extra_user_content_parts
+    )
 
 
 @pytest.mark.asyncio

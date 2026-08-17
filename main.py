@@ -8,7 +8,8 @@
 - 音频：取得原始音频后通过系统 FFmpeg 强制转换为标准 WAV，Base64 后以
   {"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,..."}}
   注入（MiMo 要求 data 携带 data: 前缀、不含 format 字段）。
-- 路由关闭时，非 MiMo 提供商完全无操作；路由开启后，多模态消息会临时选择配置的 MiMo 提供商。
+- llonebot_stt 会在任意当前模型下执行；其他媒体处理仍只对 MiMo 生效。
+- 路由开启后，多模态消息会临时选择配置的 MiMo 提供商。
 """
 
 import asyncio
@@ -354,18 +355,25 @@ class MiMoMediaPlugin(Star):
 
     @filter.on_llm_request(priority=10)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """在 MiMo 的 LLM 请求前，把消息里的视频/音频注入为多模态内容块。"""
+        """处理 MiMo 多模态媒体，或为任意模型执行 llonebot 语音转写。"""
         try:
             if not self._enabled():
                 return
-            if not self._is_mimo_provider(event):
+            is_mimo_provider = self._is_mimo_provider(event)
+            if self._audio_mode() != LLONEBOT_STT_AUDIO_MODE and not is_mimo_provider:
                 return
-            await self._handle(event, req)
+            await self._handle(event, req, process_videos=is_mimo_provider)
         except Exception as exc:  # noqa: BLE001
             logger.error("[MiMoMedia] on_llm_request 处理失败: %s", exc, exc_info=True)
 
-    async def _handle(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        videos = self._collect_video_components(event)
+    async def _handle(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        *,
+        process_videos: bool = True,
+    ) -> None:
+        videos = self._collect_video_components(event) if process_videos else []
         request_audio_refs = list(req.audio_urls or [])
         audio_targets = self._collect_audio_targets(event)
         audio_records = [record for record, _, _ in audio_targets]
@@ -433,7 +441,7 @@ class MiMoMediaPlugin(Star):
             return
 
         # 3. 移除核心生成的占位符文本，替换为真实媒体内容
-        self._drop_placeholders(req)
+        self._drop_placeholders(req, drop_video=process_videos)
 
         # 4. 纯媒体无文本时补充引导指令（MiMo 示例要求文本与媒体共存）
         if not (req.prompt or "").strip() and added_media_parts:
@@ -661,9 +669,15 @@ class MiMoMediaPlugin(Star):
             return None, "[音频解析失败，已跳过]", cleanup_paths
 
     @staticmethod
-    def _drop_placeholders(req: ProviderRequest) -> None:
+    def _drop_placeholders(
+        req: ProviderRequest,
+        *,
+        drop_video: bool = True,
+    ) -> None:
         """移除 build_main_agent 生成的 [Video/Audio Attachment ...] 占位文本。"""
-        prefixes = (*_VIDEO_PLACEHOLDER_PREFIXES, *_AUDIO_PLACEHOLDER_PREFIXES)
+        prefixes = _AUDIO_PLACEHOLDER_PREFIXES
+        if drop_video:
+            prefixes = (*_VIDEO_PLACEHOLDER_PREFIXES, *prefixes)
         kept = []
         for part in req.extra_user_content_parts:
             text = getattr(part, "text", "")
